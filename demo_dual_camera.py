@@ -24,6 +24,8 @@ import matplotlib
 matplotlib.use("Agg")  # GUI不要・ファイル保存専用（macOS Tk非互換のため）
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa
+# macOS の日本語フォント
+plt.rcParams["font.family"] = ["Hiragino Sans", "Hiragino Kaku Gothic Pro", "sans-serif"]
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -31,8 +33,15 @@ from detect_hand import HandDetector, manual_click_fallback, TARGET_LANDMARKS, S
 from triangulate import triangulate_landmarks
 from calibration.simple_calib import get_camera_matrices
 
-# ランドマークの日本語ラベル
+# OpenCV は日本語フォント非対応のため英語ラベルを使用
 LANDMARK_LABELS = {
+    "wrist":             "wrist",
+    "index_finger_tip":  "index",
+    "middle_finger_tip": "middle",
+}
+
+# matplotlib タイトル用の日本語ラベル
+LANDMARK_LABELS_JP = {
     "wrist":             "手首",
     "index_finger_tip":  "人差し指",
     "middle_finger_tip": "中指",
@@ -151,7 +160,7 @@ def plot_summary(
     for name, coords in result_3d.items():
         x, y, z = coords
         color = POINT_COLORS.get(name, "#FFFFFF")
-        label = LANDMARK_LABELS.get(name, name)
+        label = LANDMARK_LABELS_JP.get(name, name)
         ax3.scatter(x, y, z, color=color, s=120, zorder=5)
         ax3.text(x, y, z + 0.005, label, color=color, fontsize=9)
 
