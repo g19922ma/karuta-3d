@@ -1,244 +1,179 @@
 """
 録画データをブラウザでインタラクティブに3D表示するツール
 
-動作を自動でセグメント分割して、払い動作ごとに色を変えて表示する。
+払い動作ごとに色分け・凡例は動作番号1行にまとめて表示。
 
 使い方:
-    .venv/bin/python review_3d.py output/realtime/rec_YYYYMMDD_HHMMSS/3d_log.json
-
-    # 最新の録画を自動選択
     .venv/bin/python review_3d.py
-
-    # セグメント感度を調整
-    .venv/bin/python review_3d.py --speed-thresh 0.05 --rest-frames 8
+    .venv/bin/python review_3d.py output/realtime/rec_YYYYMMDD/3d_log.json
+    .venv/bin/python review_3d.py --speed-thresh 0.05 --rest-frames 5
 """
 
-import json
-import os
-import sys
-import argparse
-import glob
-import webbrowser
+import json, os, sys, argparse, glob, webbrowser
 import numpy as np
 from pathlib import Path
 
 
-# ---------- データ読み込み ----------
-
-def load_log(log_path: str) -> list[dict]:
-    with open(log_path) as f:
+def load_log(path):
+    with open(path) as f:
         return json.load(f)["frames"]
 
-
-def load_cards(card_path: str = "calibration/card_positions.json") -> list:
-    if not os.path.exists(card_path):
+def load_cards(path="calibration/card_positions.json"):
+    if not os.path.exists(path):
         return []
-    with open(card_path) as f:
+    with open(path) as f:
         return json.load(f).get("cards", [])
 
 
-# ---------- 自動セグメント分割 ----------
+# ---------- セグメント分割 ----------
 
-def segment_by_velocity(
-    frames: list[dict],
-    landmark: str = "wrist",
-    speed_thresh: float = 0.03,   # この速度[m/s相当]以下を「静止」とみなす
-    rest_frames:  int   = 8,      # N フレーム以上静止したらセグメント境界
-    min_seg_len:  int   = 10,     # この長さ未満のセグメントは除外
-) -> list[list[dict]]:
-    """
-    手首の速度から払い動作ごとにフレームを分割する。
-
-    Returns:
-        segments: [[frame, ...], [frame, ...], ...]  動作ごとのフレームリスト
-    """
-    # 手首座標を抽出
-    wrist = []
-    for f in frames:
-        lm = f.get("landmarks", {}).get(landmark)
-        wrist.append(np.array(lm) if lm else None)
-
-    # 各フレームの速度を計算
-    speeds = [0.0]
-    for i in range(1, len(wrist)):
-        if wrist[i] is not None and wrist[i-1] is not None:
-            speeds.append(float(np.linalg.norm(wrist[i] - wrist[i-1])))
-        else:
-            speeds.append(0.0)
-
-    # 静止フラグ
+def segment(frames, speed_thresh=0.03, rest_frames=8, min_len=10):
+    wrist = [np.array(f["landmarks"]["wrist"]) if f.get("landmarks", {}).get("wrist") else None
+             for f in frames]
+    speeds = [0.0] + [float(np.linalg.norm(wrist[i] - wrist[i-1]))
+                      if wrist[i] is not None and wrist[i-1] is not None else 0.0
+                      for i in range(1, len(wrist))]
     is_rest = [s < speed_thresh for s in speeds]
 
-    # 連続N フレームの静止 → セグメント境界
-    boundaries = set()
-    rest_count = 0
+    boundaries, cnt = set(), 0
     for i, r in enumerate(is_rest):
-        if r:
-            rest_count += 1
-            if rest_count == rest_frames:
-                boundaries.add(i - rest_frames + 1)
-        else:
-            rest_count = 0
+        cnt = cnt + 1 if r else 0
+        if cnt == rest_frames:
+            boundaries.add(i - rest_frames + 1)
 
-    # フレームをセグメントに分割
-    boundaries = sorted(boundaries)
-    seg_starts = [0] + boundaries
-    seg_ends   = boundaries + [len(frames)]
-
-    segments = []
-    for s, e in zip(seg_starts, seg_ends):
+    cuts = sorted(boundaries)
+    segs = []
+    for s, e in zip([0] + cuts, cuts + [len(frames)]):
         seg = frames[s:e]
-        # 手が検出されているフレームが min_seg_len 以上あるものだけ残す
-        active = [f for f in seg if f.get("landmarks", {}).get(landmark)]
-        if len(active) >= min_seg_len:
-            segments.append(seg)
+        active = sum(1 for f in seg if f.get("landmarks", {}).get("wrist"))
+        if active >= min_len:
+            segs.append(seg)
 
-    print(f"セグメント数: {len(segments)}")
-    for i, seg in enumerate(segments):
-        t0 = seg[0].get("t", 0)
-        t1 = seg[-1].get("t", 0)
-        active = len([f for f in seg if f.get("landmarks", {}).get(landmark)])
-        print(f"  #{i+1}: {t0:.2f}s〜{t1:.2f}s ({active}フレーム検出)")
-
-    return segments
+    print(f"検出動作数: {len(segs)}")
+    for i, seg in enumerate(segs):
+        t0, t1 = seg[0].get("t", 0), seg[-1].get("t", 0)
+        print(f"  #{i+1}: {t0:.2f}s〜{t1:.2f}s")
+    return segs
 
 
-# ---------- HTML生成 ----------
+# ---------- trace生成 ----------
 
-# 動作ごとの色セット
-SEG_COLORS = [
-    "#FF6B6B", "#4ECDC4", "#45B7D1", "#96CEB4",
-    "#FFEAA7", "#DDA0DD", "#98D8C8", "#F7DC6F",
-    "#BB8FCE", "#85C1E9",
-]
+SEG_COLORS = ["#FF6B6B","#4ECDC4","#45B7D1","#96CEB4","#FFEAA7",
+              "#DDA0DD","#98D8C8","#F7DC6F","#BB8FCE","#85C1E9"]
 
-CONNECTIONS = [
-    ("wrist", "index_finger_tip"),
-    ("wrist", "middle_finger_tip"),
-    ("index_finger_tip", "middle_finger_tip"),
-]
+CONNS = [("wrist","index_finger_tip"),("wrist","middle_finger_tip"),
+         ("index_finger_tip","middle_finger_tip")]
 
-
-def seg_to_traces(seg: list[dict], color: str, seg_id: int) -> list[str]:
-    """1つのセグメントのtraceリストを生成する。"""
+def seg_traces(seg, color, idx):
+    """1セグメント分のtraces。凡例は手首1行のみ、他はshowlegend:false。"""
     traces = []
-    label = f"動作#{seg_id+1}"
+    label = f"動作#{idx+1}"
+    t0 = seg[0].get("t",0); t1 = seg[-1].get("t",0)
+    hover_label = f"{label} ({t0:.1f}s〜{t1:.1f}s)"
 
-    lm_keys = ["wrist", "index_finger_tip", "middle_finger_tip"]
-    lm_labels = {"wrist": "手首", "index_finger_tip": "人差し指", "middle_finger_tip": "中指"}
-
-    # ランドマークごとの軌跡
-    for lm in lm_keys:
-        xs, ys, zs, ts = [], [], [], []
-        for f in seg:
-            pt = f.get("landmarks", {}).get(lm)
-            if pt:
-                xs.append(pt[0]); ys.append(pt[1]); zs.append(pt[2])
-                ts.append(f.get("t", 0))
-        if not xs:
-            continue
-
-        # 軌跡ライン
+    # --- 手首軌跡（凡例あり・デフォルト表示） ---
+    xs,ys,zs,ts = [],[],[],[]
+    for f in seg:
+        w = f.get("landmarks",{}).get("wrist")
+        if w: xs.append(w[0]); ys.append(w[1]); zs.append(w[2]); ts.append(f.get("t",0))
+    if xs:
         traces.append(f"""{{
-            type: 'scatter3d', mode: 'lines',
-            x: {xs}, y: {ys}, z: {zs},
-            name: '{label} {lm_labels[lm]}',
-            legendgroup: '{label}',
-            line: {{color: '{color}', width: 4}},
-            opacity: 0.8
+            type:'scatter3d', mode:'lines+markers',
+            x:{xs}, y:{ys}, z:{zs},
+            name:'{hover_label}',
+            legendgroup:'{label}',
+            line:{{color:'{color}',width:5}},
+            marker:{{size:3,color:'{color}'}},
+            hovertemplate:'%{{text}}<extra>{label}</extra>',
+            text:{[f't={t:.2f}s' for t in ts]}
+        }}""")
+        # 始点▶終点■
+        traces.append(f"""{{
+            type:'scatter3d', mode:'markers+text',
+            x:[{xs[0]},{xs[-1]}], y:[{ys[0]},{ys[-1]}], z:[{zs[0]},{zs[-1]}],
+            legendgroup:'{label}', showlegend:false,
+            text:['▶','■'], textposition:'top center',
+            textfont:{{color:'{color}',size:16}},
+            marker:{{size:[10,7], color:['{color}','#666']}},
+            hoverinfo:'skip'
         }}""")
 
-        # 始点・終点マーカー
-        if xs:
+    # --- 指先軌跡（デフォルト非表示） ---
+    for lm, lm_label in [("index_finger_tip","人差し指"),("middle_finger_tip","中指")]:
+        xs2,ys2,zs2 = [],[],[]
+        for f in seg:
+            p = f.get("landmarks",{}).get(lm)
+            if p: xs2.append(p[0]); ys2.append(p[1]); zs2.append(p[2])
+        if xs2:
             traces.append(f"""{{
-                type: 'scatter3d', mode: 'markers+text',
-                x: [{xs[0]}, {xs[-1]}], y: [{ys[0]}, {ys[-1]}], z: [{zs[0]}, {zs[-1]}],
-                name: '{label}',
-                legendgroup: '{label}',
-                showlegend: false,
-                text: ['▶', '■'],
-                textposition: 'top center',
-                textfont: {{color: '{color}', size: 14}},
-                marker: {{size: [8, 6], color: ['{color}', '#888'], symbol: ['circle', 'square']}},
-                hovertext: {[f'{label} t={t:.2f}s' for t in [ts[0], ts[-1]]]}
+                type:'scatter3d', mode:'lines',
+                x:{xs2}, y:{ys2}, z:{zs2},
+                name:'{label} {lm_label}',
+                legendgroup:'{label}', showlegend:false,
+                visible:'legendonly',
+                line:{{color:'{color}',width:2}}, opacity:0.5
             }}""")
 
-    # スケルトン（間引き）
-    step = max(1, len(seg) // 20)
+    # --- スケルトン（デフォルト非表示・間引き） ---
+    step = max(1, len(seg)//15)
     for f in seg[::step]:
-        lms = f.get("landmarks", {})
-        for a, b in CONNECTIONS:
+        lms = f.get("landmarks",{})
+        for a,b in CONNS:
             if a in lms and b in lms:
                 traces.append(f"""{{
-                    type: 'scatter3d', mode: 'lines',
-                    x: [{lms[a][0]}, {lms[b][0]}],
-                    y: [{lms[a][1]}, {lms[b][1]}],
-                    z: [{lms[a][2]}, {lms[b][2]}],
-                    line: {{color: '{color}', width: 1}},
-                    opacity: 0.25,
-                    showlegend: false, hoverinfo: 'skip',
-                    legendgroup: '{label}'
+                    type:'scatter3d', mode:'lines',
+                    x:[{lms[a][0]},{lms[b][0]}],
+                    y:[{lms[a][1]},{lms[b][1]}],
+                    z:[{lms[a][2]},{lms[b][2]}],
+                    legendgroup:'{label}', showlegend:false,
+                    visible:'legendonly',
+                    line:{{color:'{color}',width:1}}, opacity:0.3,
+                    hoverinfo:'skip'
                 }}""")
-
     return traces
 
 
-def card_traces(cards: list) -> list[str]:
-    """札のtraceリストを生成する。"""
+def card_traces(cards):
     traces = []
     for i, card in enumerate(cards):
         c = card["corners"]
-        xs = [p[0] for p in c] + [c[0][0]]
-        ys = [p[1] for p in c] + [c[0][1]]
-        zs = [p[2] for p in c] + [c[0][2]]
+        xs = [p[0] for p in c]+[c[0][0]]
+        ys = [p[1] for p in c]+[c[0][1]]
+        zs = [p[2] for p in c]+[c[0][2]]
         traces.append(f"""{{
-            type: 'scatter3d', mode: 'lines+text',
-            x: {xs}, y: {ys}, z: {zs},
-            name: '札#{i+1}',
-            legendgroup: '札',
-            line: {{color: '#FFD700', width: 3}},
-            text: ['','','#{i+1}','',''],
-            textposition: 'top center',
-            textfont: {{color: '#FFD700', size: 13}}
+            type:'scatter3d', mode:'lines+text',
+            x:{xs}, y:{ys}, z:{zs},
+            name:'札#{i+1}', legendgroup:'cards',
+            line:{{color:'#FFD700',width:3}},
+            text:['','','#{i+1}','',''],
+            textposition:'top center',
+            textfont:{{color:'#FFD700',size:13}}
         }}""")
-        # 塗りつぶし面
-        fx = [p[0] for p in c]
-        fy = [p[1] for p in c]
-        fz = [p[2] for p in c]
+        fx=[p[0] for p in c]; fy=[p[1] for p in c]; fz=[p[2] for p in c]
         traces.append(f"""{{
-            type: 'mesh3d',
-            x: {fx}, y: {fy}, z: {fz},
-            i: [0,0], j: [1,2], k: [2,3],
-            color: '#8B6914', opacity: 0.25,
-            showlegend: false, hoverinfo: 'skip'
+            type:'mesh3d', x:{fx}, y:{fy}, z:{fz},
+            i:[0,0], j:[1,2], k:[2,3],
+            color:'#8B6914', opacity:0.25,
+            legendgroup:'cards', showlegend:false, hoverinfo:'skip'
         }}""")
     return traces
 
 
-def build_html(segments: list[list[dict]], cards: list, title: str,
-               all_frames: list[dict]) -> str:
-    n_seg = len(segments)
-    n_frames = len(all_frames)
-
-    traces = []
-
-    # 札
-    traces += card_traces(cards)
-
-    # 各セグメント
-    for i, seg in enumerate(segments):
-        color = SEG_COLORS[i % len(SEG_COLORS)]
-        traces += seg_to_traces(seg, color, i)
+def build_html(segs, cards, title, n_total):
+    traces = card_traces(cards)
+    for i, seg in enumerate(segs):
+        traces += seg_traces(seg, SEG_COLORS[i % len(SEG_COLORS)], i)
 
     traces_js = ",\n".join(traces)
+    n_seg = len(segs)
 
-    # セグメントのサマリ情報
-    seg_info = ""
-    for i, seg in enumerate(segments):
-        t0 = seg[0].get("t", 0)
-        t1 = seg[-1].get("t", 0)
-        color = SEG_COLORS[i % len(SEG_COLORS)]
-        seg_info += f'<span style="color:{color}">●動作#{i+1} ({t0:.1f}s〜{t1:.1f}s)</span>　'
+    seg_badges = "".join(
+        f'<span style="background:{SEG_COLORS[i%len(SEG_COLORS)]};color:#111;'
+        f'border-radius:4px;padding:2px 8px;margin:2px;font-size:12px;cursor:pointer"'
+        f' onclick="isolate({i})">'
+        f'#{i+1} {segs[i][0].get("t",0):.1f}s〜{segs[i][-1].get("t",0):.1f}s</span>'
+        for i in range(n_seg)
+    )
 
     return f"""<!DOCTYPE html>
 <html>
@@ -247,48 +182,69 @@ def build_html(segments: list[list[dict]], cards: list, title: str,
 <title>{title}</title>
 <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
 <style>
-  body {{ margin: 0; background: #111; color: #eee; font-family: sans-serif; }}
-  #plot {{ width: 100vw; height: 88vh; }}
-  #info {{ padding: 8px 16px; font-size: 13px; line-height: 1.8; }}
+  body{{margin:0;background:#111;color:#eee;font-family:sans-serif}}
+  #plot{{width:100vw;height:82vh}}
+  #ctrl{{padding:6px 12px;font-size:12px;line-height:2}}
+  button{{background:#333;color:#eee;border:1px solid #555;border-radius:4px;
+          padding:3px 10px;margin:2px;cursor:pointer}}
+  button:hover{{background:#555}}
 </style>
 </head>
 <body>
-<div id="info">
-  <b>{title}</b> &nbsp;|&nbsp; 総フレーム: {n_frames} &nbsp;|&nbsp; 検出動作: {n_seg}件<br>
-  {seg_info}<br>
-  <span style="color:#888">ドラッグ=回転 &nbsp; スクロール=ズーム &nbsp; 凡例クリック=表示切替</span>
+<div id="ctrl">
+  <b>{title}</b> &nbsp; 総フレーム:{n_total} &nbsp; 検出動作:{n_seg}件 &nbsp;
+  <button onclick="showAll()">全表示</button>
+  <button onclick="hideAll()">全非表示</button>
+  &nbsp; 動作を選択:&nbsp;
+  {seg_badges}
+  <br>
+  <span style="color:#888;font-size:11px">
+    ドラッグ=回転 &nbsp; スクロール=ズーム &nbsp;
+    バッジクリック=その動作だけ表示 &nbsp; 凡例クリック=個別切替
+  </span>
 </div>
 <div id="plot"></div>
 <script>
-Plotly.newPlot('plot', [
-  {traces_js}
-], {{
-  paper_bgcolor: '#111',
-  plot_bgcolor:  '#111',
-  scene: {{
-    bgcolor: '#111',
-    xaxis: {{title: 'X', color: '#888', gridcolor: '#333'}},
-    yaxis: {{title: 'Y', color: '#888', gridcolor: '#333'}},
-    zaxis: {{title: 'Z', color: '#888', gridcolor: '#333'}},
-    aspectmode: 'data'
+var data = [{traces_js}];
+Plotly.newPlot('plot', data, {{
+  paper_bgcolor:'#111', plot_bgcolor:'#111',
+  scene:{{
+    bgcolor:'#111',
+    xaxis:{{title:'X',color:'#666',gridcolor:'#333'}},
+    yaxis:{{title:'Y',color:'#666',gridcolor:'#333'}},
+    zaxis:{{title:'Z',color:'#666',gridcolor:'#333'}},
+    aspectmode:'data'
   }},
-  legend: {{bgcolor: '#222', font: {{color: '#ccc'}}, itemclick: 'toggleothers'}},
-  margin: {{l:0, r:0, t:0, b:0}}
-}}, {{responsive: true}});
+  legend:{{bgcolor:'#1e1e1e',font:{{color:'#ccc',size:12}},
+           tracegroupgap:4, itemclick:'toggle'}},
+  margin:{{l:0,r:160,t:0,b:0}}
+}}, {{responsive:true}});
+
+function showAll(){{
+  Plotly.restyle('plot', {{visible:true}}, [...Array(data.length).keys()]);
+}}
+function hideAll(){{
+  Plotly.restyle('plot', {{visible:'legendonly'}}, [...Array(data.length).keys()]);
+}}
+function isolate(segIdx){{
+  // 全トレースを非表示にしてから指定セグメントだけ表示
+  var updates = data.map(function(t,i){{
+    var grp = t.legendgroup || '';
+    var target = '動作#'+(segIdx+1);
+    return grp === target || grp === 'cards' ? true : 'legendonly';
+  }});
+  Plotly.restyle('plot', 'visible', updates);
+}}
 </script>
 </body>
 </html>"""
 
 
-# ---------- メイン ----------
-
 def main():
-    parser = argparse.ArgumentParser(description="払い動作ごとに色分けして3D表示")
-    parser.add_argument("log",           nargs="?", help="3d_log.json のパス（省略で最新）")
-    parser.add_argument("--speed-thresh", type=float, default=0.03,
-                        help="静止とみなす速度閾値（小さくすると細かく分割）")
-    parser.add_argument("--rest-frames",  type=int,   default=8,
-                        help="静止と判定するフレーム数（小さくすると細かく分割）")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("log", nargs="?")
+    parser.add_argument("--speed-thresh", type=float, default=0.03)
+    parser.add_argument("--rest-frames",  type=int,   default=8)
     args = parser.parse_args()
 
     if args.log:
@@ -296,36 +252,25 @@ def main():
     else:
         logs = sorted(glob.glob("output/realtime/rec_*/3d_log.json"))
         if not logs:
-            print("録画データが見つかりません")
-            sys.exit(1)
+            print("録画データが見つかりません"); sys.exit(1)
         log_path = logs[-1]
-        print(f"最新の録画を使用: {log_path}")
+        print(f"使用: {log_path}")
 
     frames = load_log(log_path)
     cards  = load_cards()
     title  = Path(log_path).parent.name
 
-    print(f"総フレーム数: {len(frames)}")
-
-    segments = segment_by_velocity(
-        frames,
-        speed_thresh=args.speed_thresh,
-        rest_frames=args.rest_frames,
-    )
-
-    if not segments:
-        print("動作が検出できませんでした。--speed-thresh を大きくしてみてください。")
+    segs = segment(frames, args.speed_thresh, args.rest_frames)
+    if not segs:
+        print("動作が検出できません。--speed-thresh を大きくしてみてください")
         sys.exit(1)
 
-    html = build_html(segments, cards, title, frames)
-
-    out_path = str(Path(log_path).parent / "review_3d.html")
-    with open(out_path, "w", encoding="utf-8") as f:
+    html = build_html(segs, cards, title, len(frames))
+    out  = str(Path(log_path).parent / "review_3d.html")
+    with open(out, "w", encoding="utf-8") as f:
         f.write(html)
-
-    print(f"保存: {out_path}")
-    webbrowser.open(f"file://{os.path.abspath(out_path)}")
-
+    print(f"保存: {out}")
+    webbrowser.open(f"file://{os.path.abspath(out)}")
 
 if __name__ == "__main__":
     main()
