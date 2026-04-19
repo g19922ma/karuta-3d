@@ -207,9 +207,23 @@ def draw_3d_text(canvas: np.ndarray, pts3d: dict | None, fps: float):
 
 # ---------- メインループ ----------
 
+STEREO_CALIB_PATH = "calibration/stereo_calib.json"
+
+def load_projection_matrices():
+    """stereo_calib.json があれば本格キャリブ、なければ近似キャリブを使う。"""
+    if os.path.exists(STEREO_CALIB_PATH):
+        from calibration.full_calib import load_calibration
+        print(f"[realtime] キャリブレーション読み込み: {STEREO_CALIB_PATH}")
+        _, _, _, _, _, _, P1, P2 = load_calibration({"calibration_file": STEREO_CALIB_PATH})
+    else:
+        print("[realtime] stereo_calib.json が見つかりません → 近似キャリブを使用")
+        print("  精度を上げるには: .venv/bin/python calibrate_realtime.py")
+        _, _, _, _, _, _, P1, P2 = get_camera_matrices({})
+    return P1, P2
+
+
 def main():
-    config = {}
-    _, _, _, _, _, _, P1, P2 = get_camera_matrices(config)
+    P1, P2 = load_projection_matrices()
 
     # カメラスレッド起動
     cam_pc    = CameraThread(CAM_PC,    "Mac")
