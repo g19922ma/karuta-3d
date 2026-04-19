@@ -32,6 +32,13 @@ LANDMARK_INDEX = {
 # デフォルトで取得するランドマーク名
 TARGET_LANDMARKS = ["wrist", "index_finger_tip", "middle_finger_tip"]
 
+# OpenCV用BGR色（matplotlibのhex色とは別）
+POINT_COLORS_BGR = {
+    "wrist":             (80,  80,  255),   # 赤
+    "index_finger_tip":  (255, 160,  50),   # 青
+    "middle_finger_tip": (80,  220,  80),   # 緑
+}
+
 # 可視化用スケルトン接続
 SKELETON_CONNECTIONS = [
     ("wrist", "index_finger_tip"),
