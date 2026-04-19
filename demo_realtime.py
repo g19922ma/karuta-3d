@@ -283,7 +283,7 @@ def main():
                 front_view = make_projection_view(trail, pts3d, view="front")
 
                 # 座標テキストパネル
-                text_panel = np.zeros((MINI_SIZE, DISPLAY_W * 2 - MINI_SIZE, 3), dtype=np.uint8)
+                text_panel = np.zeros((MINI_SIZE, DISPLAY_W * 2 - MINI_SIZE * 2, 3), dtype=np.uint8)
                 draw_3d_text(text_panel, pts3d, fps)
 
                 bottom_row = np.hstack([top_view, front_view, text_panel])
