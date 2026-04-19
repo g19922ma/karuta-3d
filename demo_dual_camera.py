@@ -21,7 +21,7 @@ import json
 from datetime import datetime
 
 import matplotlib
-matplotlib.use("TkAgg")  # macOS で plt.show() が動くバックエンド
+matplotlib.use("Agg")  # GUI不要・ファイル保存専用（macOS Tk非互換のため）
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa
 
@@ -182,9 +182,10 @@ def plot_summary(
 
     plt.savefig(output_path, dpi=150, bbox_inches="tight",
                 facecolor=fig.get_facecolor())
-    print(f"サマリ画像保存: {output_path}")
-    plt.show()
     plt.close()
+    print(f"サマリ画像保存: {output_path}")
+    # macOS のプレビューで自動的に開く
+    os.system(f"open '{output_path}'")
 
 
 def run_dual_demo(cam_pc: int, cam_phone: int, config: dict):
