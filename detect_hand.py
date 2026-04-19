@@ -60,9 +60,10 @@ class HandDetector:
 
     def __init__(
         self,
-        max_hands: int = 1,
+        max_hands: int = 2,           # 左右どちらか選べるよう2に増やす
         min_detection_confidence: float = 0.5,
         model_path: str = _DEFAULT_MODEL,
+        target_hand: str | None = "Right",  # "Right" / "Left" / None(どちらでも)
     ):
         if not os.path.exists(model_path):
             raise FileNotFoundError(
@@ -78,6 +79,9 @@ class HandDetector:
             min_hand_detection_confidence=min_detection_confidence,
         )
         self._detector = vision.HandLandmarker.create_from_options(options)
+        # "Right"/"Left" はMediaPipeの判定基準（カメラ視点）
+        # 通常カメラ（非ミラー）では "Right" = 被写体の右手
+        self.target_hand = target_hand
 
     def detect(self, frame: np.ndarray, target_landmarks: list[str] | None = None) -> dict | None:
         """
@@ -88,7 +92,7 @@ class HandDetector:
             target_landmarks: 取得するランドマーク名のリスト
 
         Returns:
-            {landmark_name: (x_pixel, y_pixel)} または None（検出失敗）
+            {landmark_name: (x_pixel, y_pixel)} または None（検出失敗 or 対象の手なし）
         """
         if target_landmarks is None:
             target_landmarks = TARGET_LANDMARKS
@@ -101,8 +105,19 @@ class HandDetector:
             return None
 
         h, w = frame.shape[:2]
-        hand = result.hand_landmarks[0]  # 最初の手のみ使用
 
+        # 対象の手を選ぶ
+        hand_idx = None
+        for i, handedness_list in enumerate(result.handedness):
+            label = handedness_list[0].category_name  # "Right" or "Left"
+            if self.target_hand is None or label == self.target_hand:
+                hand_idx = i
+                break
+
+        if hand_idx is None:
+            return None  # 指定した手が見つからない
+
+        hand = result.hand_landmarks[hand_idx]
         points = {}
         for name in target_landmarks:
             idx = LANDMARK_INDEX.get(name)
