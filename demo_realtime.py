@@ -1,23 +1,22 @@
 """
 リアルタイム2視点3D手姿勢復元
 
-2台のカメラから同時にフレームを取得し、MediaPipeで手を検出、
-三角測量で3D座標を計算してリアルタイム表示する。
-
 表示レイアウト:
     左上: Mac カメラ (2D骨格重ね)
     右上: iPhone  (2D骨格重ね)
-    左下: 上から見た3D投影 (X-Z平面)
-    右下: 正面から見た3D投影 (X-Y平面) + 座標数値
+    下段左: マウスでくるくる回せる3Dビュー（札も表示）
+    下段右: 座標数値 + FPS
 
 使い方:
     .venv/bin/python demo_realtime.py
 
 操作:
-    q     : 終了
-    s     : 現在フレームをスナップショット保存
+    3Dビューをマウスドラッグで回転  ホイールでズーム
+    r     : 録画開始 / 停止
+    s     : スナップショット保存
     t     : トレイル（軌跡）のクリア
     SPACE : 一時停止 / 再開
+    q     : 終了
 """
 
 import cv2
@@ -35,6 +34,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from detect_hand import HandDetector, TARGET_LANDMARKS, SKELETON_CONNECTIONS, POINT_COLORS_BGR
 from triangulate import triangulate_landmarks
 from calibration.simple_calib import get_camera_matrices
+from viewer_3d import Viewer3D, load_cards
 
 # ---------- 設定 ----------
 
@@ -237,6 +237,13 @@ def main():
 
     os.makedirs("output/realtime", exist_ok=True)
 
+    # 3Dビューア初期化
+    cards  = load_cards()
+    viewer = Viewer3D(size=MINI_SIZE * 2)
+    win_name = "karuta-3d  realtime"
+    cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
+    cv2.setMouseCallback(win_name, viewer.on_mouse)
+
     with HandDetector() as detector:
         trail   = deque(maxlen=TRAIL_LEN)
         pts3d   = None
@@ -297,14 +304,18 @@ def main():
                 top_row = np.hstack([d_pc, d_phone])
 
                 # 3D投影ビュー
-                top_view   = make_projection_view(trail, pts3d, view="top")
-                front_view = make_projection_view(trail, pts3d, view="front")
+                # 回転3Dビュー
+                view3d_canvas = viewer.render(
+                    pts3d, trail, cards,
+                    SKELETON_CONNECTIONS, POINT_COLORS_BGR
+                )
+                view3d_canvas = cv2.resize(view3d_canvas, (MINI_SIZE * 2, MINI_SIZE))
 
                 # 座標テキストパネル
                 text_panel = np.zeros((MINI_SIZE, DISPLAY_W * 2 - MINI_SIZE * 2, 3), dtype=np.uint8)
                 draw_3d_text(text_panel, pts3d, fps)
 
-                bottom_row = np.hstack([top_view, front_view, text_panel])
+                bottom_row = np.hstack([view3d_canvas, text_panel])
 
                 # 全体
                 canvas = np.vstack([top_row, bottom_row])
@@ -328,7 +339,7 @@ def main():
                     cv2.putText(canvas, "PAUSED", (canvas.shape[1]//2 - 60, 50),
                                 cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 200, 255), 3)
 
-                cv2.imshow("karuta-3d  realtime", canvas)
+                cv2.imshow(win_name, canvas)
 
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):

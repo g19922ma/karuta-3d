@@ -262,7 +262,25 @@ def main():
     with open(OUTPUT_PATH, "w") as f:
         json.dump(result, f, indent=2)
 
+    # 札の3D座標を保存（3Dビューで表示するため）
+    cards = []
+    for i in range(n_cards):
+        x0 = i * (CARD_W + spacing)
+        cards.append({
+            "id": i,
+            "corners": [
+                [x0,          0,      0],
+                [x0 + CARD_W, 0,      0],
+                [x0 + CARD_W, CARD_H, 0],
+                [x0,          CARD_H, 0],
+            ]
+        })
+    card_path = "calibration/card_positions.json"
+    with open(card_path, "w") as f:
+        json.dump({"cards": cards, "card_w": CARD_W, "card_h": CARD_H}, f, indent=2)
+
     print(f"\n保存: {OUTPUT_PATH}")
+    print(f"保存: {card_path}")
     print(f"RMS再投影誤差: {rms:.4f} px")
     if rms > 5.0:
         print("  ※ 誤差が大きいです。クリック精度を上げるか点数を増やすと改善します")
