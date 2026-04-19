@@ -20,12 +20,29 @@ import argparse
 import json
 from datetime import datetime
 
+import matplotlib
+matplotlib.use("TkAgg")  # macOS で plt.show() が動くバックエンド
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D  # noqa
+
 sys.path.insert(0, os.path.dirname(__file__))
 
-from detect_hand import HandDetector, manual_click_fallback, TARGET_LANDMARKS
+from detect_hand import HandDetector, manual_click_fallback, TARGET_LANDMARKS, SKELETON_CONNECTIONS
 from triangulate import triangulate_landmarks
-from visualize_3d import plot_single_frame
 from calibration.simple_calib import get_camera_matrices
+
+# ランドマークの日本語ラベル
+LANDMARK_LABELS = {
+    "wrist":             "手首",
+    "index_finger_tip":  "人差し指",
+    "middle_finger_tip": "中指",
+}
+
+POINT_COLORS = {
+    "wrist":             "#FF4444",
+    "index_finger_tip":  "#44AAFF",
+    "middle_finger_tip": "#44FF88",
+}
 
 
 def show_dual_preview(cap_pc: cv2.VideoCapture, cap_phone: cv2.VideoCapture) -> tuple[np.ndarray, np.ndarray] | None:
@@ -73,6 +90,101 @@ def show_dual_preview(cap_pc: cv2.VideoCapture, cap_phone: cv2.VideoCapture) -> 
             cv2.waitKey(300)
             cv2.destroyAllWindows()
             return f1, f2
+
+
+def draw_2d_detections(frame: np.ndarray, pts: dict, label: str) -> np.ndarray:
+    """2Dフレームに検出点・ラベル・スケルトン線を描画する。"""
+    vis = frame.copy()
+    for name, (x, y) in pts.items():
+        color_hex = POINT_COLORS.get(name, "#FFFFFF")
+        r, g, b = int(color_hex[1:3], 16), int(color_hex[3:5], 16), int(color_hex[5:7], 16)
+        color_bgr = (b, g, r)
+        cv2.circle(vis, (int(x), int(y)), 10, color_bgr, -1)
+        jp = LANDMARK_LABELS.get(name, name)
+        cv2.putText(vis, jp, (int(x) + 12, int(y) - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, color_bgr, 2)
+    for a, b_name in SKELETON_CONNECTIONS:
+        if a in pts and b_name in pts:
+            ca = POINT_COLORS.get(a, "#FFFFFF")
+            bgr = (int(ca[5:7], 16), int(ca[3:5], 16), int(ca[1:3], 16))
+            cv2.line(vis, (int(pts[a][0]), int(pts[a][1])),
+                     (int(pts[b_name][0]), int(pts[b_name][1])), bgr, 2)
+    cv2.putText(vis, label, (16, 44), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 3)
+    return vis
+
+
+def plot_summary(
+    frame_pc: np.ndarray,
+    frame_phone: np.ndarray,
+    pts_pc: dict,
+    pts_phone: dict,
+    result_3d: dict,
+    output_path: str,
+):
+    """
+    左: PC フレーム (2D検出点)
+    中: Phoneフレーム (2D検出点)
+    右: 3D復元結果
+    の3列サマリ図を表示・保存する。
+    """
+    fig = plt.figure(figsize=(18, 6))
+    fig.patch.set_facecolor("#1a1a2e")
+
+    # --- 左: PC フレーム ---
+    ax1 = fig.add_subplot(1, 3, 1)
+    vis_pc = draw_2d_detections(frame_pc, pts_pc, "Mac カメラ")
+    ax1.imshow(cv2.cvtColor(vis_pc, cv2.COLOR_BGR2RGB))
+    ax1.set_title("① Mac カメラ（2D検出点）", color="white", fontsize=12)
+    ax1.axis("off")
+
+    # --- 中: Phone フレーム ---
+    ax2 = fig.add_subplot(1, 3, 2)
+    vis_ph = draw_2d_detections(frame_phone, pts_phone, "iPhone")
+    ax2.imshow(cv2.cvtColor(vis_ph, cv2.COLOR_BGR2RGB))
+    ax2.set_title("② iPhone（2D検出点）", color="white", fontsize=12)
+    ax2.axis("off")
+
+    # --- 右: 3D復元 ---
+    ax3 = fig.add_subplot(1, 3, 3, projection="3d")
+    ax3.set_facecolor("#0d0d1a")
+
+    for name, coords in result_3d.items():
+        x, y, z = coords
+        color = POINT_COLORS.get(name, "#FFFFFF")
+        label = LANDMARK_LABELS.get(name, name)
+        ax3.scatter(x, y, z, color=color, s=120, zorder=5)
+        ax3.text(x, y, z + 0.005, label, color=color, fontsize=9)
+
+    for a, b_name in SKELETON_CONNECTIONS:
+        if a in result_3d and b_name in result_3d:
+            xs = [result_3d[a][0], result_3d[b_name][0]]
+            ys = [result_3d[a][1], result_3d[b_name][1]]
+            zs = [result_3d[a][2], result_3d[b_name][2]]
+            color = POINT_COLORS.get(a, "#AAAAAA")
+            ax3.plot(xs, ys, zs, color=color, linewidth=2.5, alpha=0.8)
+
+    ax3.set_xlabel("X", color="white")
+    ax3.set_ylabel("Y", color="white")
+    ax3.set_zlabel("Z (奥行き)", color="white")
+    ax3.tick_params(colors="white")
+    ax3.set_title("③ 3D復元（2視点から計算）", color="white", fontsize=12)
+
+    # 矢印で「流れ」を示す注釈
+    fig.text(0.34, 0.5, "→", fontsize=28, color="#AAAAAA",
+             ha="center", va="center")
+    fig.text(0.355, 0.42, "2D対応点\nから三角測量", fontsize=8,
+             color="#AAAAAA", ha="center", va="center")
+    fig.text(0.67, 0.5, "→", fontsize=28, color="#AAAAAA",
+             ha="center", va="center")
+
+    plt.suptitle("2視点 → 3D手姿勢復元", color="white", fontsize=14, y=1.01)
+    plt.tight_layout()
+
+    plt.savefig(output_path, dpi=150, bbox_inches="tight",
+                facecolor=fig.get_facecolor())
+    print(f"サマリ画像保存: {output_path}")
+    plt.show()
+    plt.close()
 
 
 def run_dual_demo(cam_pc: int, cam_phone: int, config: dict):
@@ -143,7 +255,8 @@ def run_dual_demo(cam_pc: int, cam_phone: int, config: dict):
     # 結果表示
     print("\n=== 復元された3D座標（単位: 近似m, カメラ1原点） ===")
     for name, coords in result_3d.items():
-        print(f"  {name:25s}: X={coords[0]:.4f}  Y={coords[1]:.4f}  Z={coords[2]:.4f}")
+        label = LANDMARK_LABELS.get(name, name)
+        print(f"  {label:12s}: X={coords[0]:.3f}  Y={coords[1]:.3f}  Z={coords[2]:.3f}")
 
     # JSON 保存
     json_path = f"{out_dir}/3d_result.json"
@@ -151,16 +264,10 @@ def run_dual_demo(cam_pc: int, cam_phone: int, config: dict):
         json.dump({"landmarks": result_3d, "cam_pc": cam_pc, "cam_phone": cam_phone}, f, indent=2)
     print(f"JSON 保存: {json_path}")
 
-    # 3D可視化
-    print("3D可視化...")
-    plot_single_frame(
-        result_3d,
-        TARGET_LANDMARKS,
-        output_path=f"{out_dir}/3d_result.png",
-        show=True,
-        title="Dual Camera 3D Hand",
-    )
-    print(f"画像保存: {out_dir}/3d_result.png")
+    # サマリ可視化（2Dフレーム + 3D）
+    print("可視化中...")
+    summary_path = f"{out_dir}/summary.png"
+    plot_summary(frame_pc, frame_phone, pts_pc, pts_phone, result_3d, summary_path)
     print(f"\n完了！結果: {out_dir}/")
 
 
