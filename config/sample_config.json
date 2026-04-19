@@ -1,0 +1,19 @@
+{
+  "_comment": "simple_calib.py で使用するカメラパラメータの近似値。実際のカメラに合わせて調整してください。",
+
+  "pc_width":  1920,
+  "pc_height": 1080,
+  "pc_fx":     1536,
+  "pc_fy":     1536,
+
+  "phone_width":  1920,
+  "phone_height": 1080,
+  "phone_fx":     1728,
+  "phone_fy":     1728,
+
+  "baseline":        0.5,
+  "phone_angle_deg": -20.0,
+
+  "_comment_calib": "full_calib モード使用時はこちらを指定",
+  "calibration_file": "calibration/stereo_calib.json"
+}
