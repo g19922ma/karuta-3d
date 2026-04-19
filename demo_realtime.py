@@ -200,7 +200,7 @@ def draw_3d_text(canvas: np.ndarray, pts3d: dict | None, fps: float):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
         y += 26
 
-    cv2.putText(canvas, "s=save  t=clear trail  q=quit",
+    cv2.putText(canvas, "r=rec  s=snap  t=clear  SPACE=pause  q=quit",
                 (10, canvas.shape[0] - 10),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.42, (120, 120, 120), 1)
 
@@ -232,6 +232,10 @@ def main():
         paused  = False
         fps     = 0.0
         t_prev  = time.time()
+        # 録画用
+        writer      = None
+        rec_log     = []   # 3D座標ログ
+        rec_start_t = None
 
         while True:
             if not paused:
@@ -291,6 +295,20 @@ def main():
                 # 全体
                 canvas = np.vstack([top_row, bottom_row])
 
+                # 録画中インジケータ
+                if writer is not None:
+                    elapsed = time.time() - rec_start_t
+                    cv2.circle(canvas, (canvas.shape[1] - 24, 20), 10, (0, 0, 255), -1)
+                    cv2.putText(canvas, f"REC {elapsed:.1f}s",
+                                (canvas.shape[1] - 110, 26),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                    writer.write(canvas)
+                    if pts3d:
+                        rec_log.append({
+                            "t": round(elapsed, 3),
+                            "landmarks": {k: list(v) for k, v in pts3d.items()}
+                        })
+
                 # 一時停止インジケータ
                 if paused:
                     cv2.putText(canvas, "PAUSED", (canvas.shape[1]//2 - 60, 50),
@@ -306,6 +324,29 @@ def main():
             elif key == ord("t"):
                 trail.clear()
                 print("トレイルをクリアしました")
+            elif key == ord("r"):
+                if writer is None:
+                    # 録画開始
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    rec_dir = f"output/realtime/rec_{ts}"
+                    os.makedirs(rec_dir, exist_ok=True)
+                    h, w = canvas.shape[:2]
+                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                    vid_path = f"{rec_dir}/video.mp4"
+                    writer = cv2.VideoWriter(vid_path, fourcc, 15, (w, h))
+                    rec_log = []
+                    rec_start_t = time.time()
+                    print(f"録画開始: {vid_path}")
+                else:
+                    # 録画停止・保存
+                    writer.release()
+                    writer = None
+                    json_path = f"{rec_dir}/3d_log.json"
+                    with open(json_path, "w") as f:
+                        json.dump({"frames": rec_log}, f, indent=2)
+                    print(f"録画停止 → {rec_dir}/")
+                    print(f"  動画: video.mp4  ({len(rec_log)} フレームの3D座標: 3d_log.json)")
+                    rec_dir = None
             elif key == ord("s"):
                 ts = datetime.now().strftime("%H%M%S")
                 path = f"output/realtime/snap_{ts}.png"
@@ -315,6 +356,14 @@ def main():
                     with open(json_path, "w") as f:
                         json.dump({"landmarks": pts3d}, f, indent=2)
                 print(f"スナップショット保存: {path}")
+
+    # 録画中に終了した場合も保存
+    if writer is not None:
+        writer.release()
+        json_path = f"{rec_dir}/3d_log.json"
+        with open(json_path, "w") as f:
+            json.dump({"frames": rec_log}, f, indent=2)
+        print(f"録画を保存しました: {rec_dir}/")
 
     cam_pc.stop()
     cam_phone.stop()
