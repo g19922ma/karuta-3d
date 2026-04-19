@@ -1,20 +1,21 @@
 """
 MediaPipe Hands による手のキーポイント検出 + 手動クリックフォールバック
 
+mediapipe 0.10+ の Tasks API を使用。
+モデルファイル hand_landmarker.task が必要（初回のみダウンロード）。
+
 検出対象のランドマーク:
     wrist            : 手首 (idx=0)
     index_finger_tip : 人差し指先端 (idx=8)
     middle_finger_tip: 中指先端 (idx=12)
-
-追加ランドマーク（拡張時に使用可）:
-    thumb_tip        : 親指先端 (idx=4)
-    ring_finger_tip  : 薬指先端 (idx=16)
-    pinky_tip        : 小指先端 (idx=20)
 """
 
+import os
 import cv2
 import mediapipe as mp
 import numpy as np
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
 
 # ---------- 設定 ----------
 
@@ -38,29 +39,45 @@ SKELETON_CONNECTIONS = [
     ("index_finger_tip", "middle_finger_tip"),
 ]
 
+# モデルファイルのデフォルトパス
+_DEFAULT_MODEL = os.path.join(os.path.dirname(__file__), "hand_landmarker.task")
+
 
 # ---------- 検出器クラス ----------
 
 class HandDetector:
     """
-    MediaPipe Hands のラッパー。
+    MediaPipe Hand Landmarker (Tasks API) のラッパー。
     インスタンスを使い回してモデルの再初期化コストを避ける。
     """
 
-    def __init__(self, max_hands: int = 1, min_detection_confidence: float = 0.5):
-        self._mp_hands = mp.solutions.hands
-        self._hands = self._mp_hands.Hands(
-            static_image_mode=True,
-            max_num_hands=max_hands,
-            min_detection_confidence=min_detection_confidence,
+    def __init__(
+        self,
+        max_hands: int = 1,
+        min_detection_confidence: float = 0.5,
+        model_path: str = _DEFAULT_MODEL,
+    ):
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(
+                f"モデルファイルが見つかりません: {model_path}\n"
+                "ダウンロード:\n"
+                "  curl -L -o hand_landmarker.task "
+                "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
+            )
+        base_options = python.BaseOptions(model_asset_path=model_path)
+        options = vision.HandLandmarkerOptions(
+            base_options=base_options,
+            num_hands=max_hands,
+            min_hand_detection_confidence=min_detection_confidence,
         )
+        self._detector = vision.HandLandmarker.create_from_options(options)
 
     def detect(self, frame: np.ndarray, target_landmarks: list[str] | None = None) -> dict | None:
         """
         フレームから指定ランドマークの2D座標を返す。
 
         Args:
-            frame          : BGR 画像 (numpy array)
+            frame           : BGR 画像 (numpy array)
             target_landmarks: 取得するランドマーク名のリスト
 
         Returns:
@@ -70,20 +87,21 @@ class HandDetector:
             target_landmarks = TARGET_LANDMARKS
 
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = self._hands.process(rgb)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        result = self._detector.detect(mp_image)
 
-        if not results.multi_hand_landmarks:
+        if not result.hand_landmarks:
             return None
 
         h, w = frame.shape[:2]
-        hand = results.multi_hand_landmarks[0]  # 最初の手のみ使用
+        hand = result.hand_landmarks[0]  # 最初の手のみ使用
 
         points = {}
         for name in target_landmarks:
             idx = LANDMARK_INDEX.get(name)
             if idx is None:
                 continue
-            lm = hand.landmark[idx]
+            lm = hand[idx]
             points[name] = (lm.x * w, lm.y * h)
 
         return points
@@ -103,7 +121,7 @@ class HandDetector:
         return vis
 
     def close(self):
-        self._hands.close()
+        self._detector.close()
 
     def __enter__(self):
         return self
