@@ -54,10 +54,12 @@ DETECT_INTERVAL = 2  # N フレームに1回検出（1=毎フレーム, 2=半分
 class CameraThread(threading.Thread):
     """バックグラウンドでカメラを読み続け、最新フレームを保持するスレッド。"""
 
-    def __init__(self, cam_id: int, name: str):
+    def __init__(self, cam_id: int, name: str,
+                 width: int | None = None, height: int | None = None):
         super().__init__(daemon=True)
         self.cam_id = cam_id
         self.name_ = name
+        self.req_size = (width, height)
         self.frame = None
         self.lock = threading.Lock()
         self.running = True
@@ -65,9 +67,15 @@ class CameraThread(threading.Thread):
 
     def run(self):
         self._cap = cv2.VideoCapture(self.cam_id)
+        if self.req_size[0] is not None:
+            self._cap.set(cv2.CAP_PROP_FRAME_WIDTH,  self.req_size[0])
+            self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.req_size[1])
         if not self._cap.isOpened():
             print(f"[{self.name_}] カメラ {self.cam_id} を開けませんでした")
             return
+        actual_w = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_h = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        print(f"[{self.name_}] cam={self.cam_id}: {actual_w}x{actual_h}")
         while self.running:
             ret, frame = self._cap.read()
             if ret:

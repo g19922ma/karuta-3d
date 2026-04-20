@@ -96,22 +96,39 @@ def extract_correspondences(
 
 # ---------- キャリブレーション ----------
 
+def _init_intrinsic_matrix(img_size: tuple) -> np.ndarray:
+    """画像サイズから妥当な初期内部パラメータ行列を作る。
+    典型的なカメラで焦点距離は画像幅とほぼ同程度。"""
+    w, h = img_size
+    return np.array([
+        [w, 0, w / 2],
+        [0, w, h / 2],
+        [0, 0, 1.0],
+    ], dtype=np.float64)
+
+
 def run_calibration(obj_pts, img_pts1, img_pts2, img_size1, img_size2):
     """個別キャリブ→ステレオキャリブ。"""
     print(f"\nキャリブレーション実行中... ({len(obj_pts)}ペア)")
     print(f"  カメラ1画像サイズ: {img_size1}")
     print(f"  カメラ2画像サイズ: {img_size2}")
 
-    # 歪みモデルを単純化（平面ターゲット + 少数キャプチャでの発散を防止）
-    flags = (cv2.CALIB_ZERO_TANGENT_DIST |
+    # 初期値ガイド + 制約強化（平面ターゲット+少数キャプチャでの発散を防ぐ）
+    flags = (cv2.CALIB_USE_INTRINSIC_GUESS |
+             cv2.CALIB_FIX_PRINCIPAL_POINT |   # 主点を画像中心に固定（広角補正済みカメラなら妥当）
+             cv2.CALIB_FIX_ASPECT_RATIO |      # fx = fy
+             cv2.CALIB_ZERO_TANGENT_DIST |
              cv2.CALIB_FIX_K2 |
              cv2.CALIB_FIX_K3)
 
+    K1_init = _init_intrinsic_matrix(img_size1)
+    K2_init = _init_intrinsic_matrix(img_size2)
+
     rms1, K1, d1, _, _ = cv2.calibrateCamera(
-        obj_pts, img_pts1, img_size1, None, None, flags=flags
+        obj_pts, img_pts1, img_size1, K1_init, None, flags=flags
     )
     rms2, K2, d2, _, _ = cv2.calibrateCamera(
-        obj_pts, img_pts2, img_size2, None, None, flags=flags
+        obj_pts, img_pts2, img_size2, K2_init, None, flags=flags
     )
     print(f"  個別RMS  Cam1={rms1:.3f}px  Cam2={rms2:.3f}px")
     print(f"  Cam1 焦点 fx={K1[0,0]:.0f} fy={K1[1,1]:.0f}  中心 cx={K1[0,2]:.0f} cy={K1[1,2]:.0f}")
@@ -223,8 +240,10 @@ def main():
     markers_3d = meta["markers_3d"]
     n_required = len(markers_3d)
 
-    cam_pc    = CameraThread(CAM_PC,    "Mac")
-    cam_phone = CameraThread(CAM_PHONE, "Phone")
+    # 両カメラを同じ解像度に揃える（キャリブの安定性のため）
+    CALIB_W, CALIB_H = 1280, 720
+    cam_pc    = CameraThread(CAM_PC,    "Mac",   width=CALIB_W, height=CALIB_H)
+    cam_phone = CameraThread(CAM_PHONE, "Phone", width=CALIB_W, height=CALIB_H)
     cam_pc.start(); cam_phone.start()
     time.sleep(1.0)
 
