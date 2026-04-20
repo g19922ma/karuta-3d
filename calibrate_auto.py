@@ -143,11 +143,23 @@ def main():
 
     print(f"=== ArUcoシート自動キャリブレーション ===")
     print(f"必要マーカー: {n_required}個（全部見えた時だけペアを取れます）")
-    print(f"SPACE=取得  c=キャリブ実行  d=削除  q=終了")
+    print(f"モード: AUTO（停止→自動取得）  a=手動/自動切替  c=キャリブ実行  d=削除  q=終了")
     print(f"目標: {RECOMMEND}ペア\n")
 
     obj_pts_all, img_pts1_all, img_pts2_all = [], [], []
     img_size = None
+
+    # 自動取得モード（デフォルトON）
+    auto_mode = True
+    # 安定判定: 全マーカーが検出できて、平均位置が前回取得時から十分動いた状態で
+    # STABLE_FRAMES フレーム連続静止したら取得
+    STABLE_FRAMES      = 12    # 約0.4秒（30fps想定）
+    STILL_THRESHOLD_PX = 3.0   # このピクセル以下の動きを「静止」とみなす
+    DIFF_THRESHOLD_PX  = 30.0  # 前回取得との最小変化量
+
+    stable_count = 0
+    last_m1_center = None
+    last_captured_m1_center = None
 
     try:
         while True:
@@ -165,6 +177,38 @@ def main():
             # 両カメラで検出された共通のマーカーID
             common_ids = set(m1.keys()) & set(m2.keys()) & set(int(k) for k in markers_3d.keys())
             all_detected = len(common_ids) == n_required
+
+            # 自動取得判定: 全マーカー検出 + 静止 + 前回から動いた
+            auto_capture_now = False
+            if all_detected:
+                # 現在のマーカー中心（全マーカー平均）
+                cur_center = np.mean([m1[i].mean(axis=0) for i in common_ids], axis=0)
+
+                if last_m1_center is not None:
+                    movement = float(np.linalg.norm(cur_center - last_m1_center))
+                else:
+                    movement = 999.0
+
+                # 前回取得からの変化量
+                if last_captured_m1_center is not None:
+                    diff_from_last = float(np.linalg.norm(cur_center - last_captured_m1_center))
+                else:
+                    diff_from_last = 999.0
+
+                last_m1_center = cur_center
+
+                # 静止 + 十分変化 → カウントアップ
+                if movement < STILL_THRESHOLD_PX and diff_from_last > DIFF_THRESHOLD_PX:
+                    stable_count += 1
+                else:
+                    stable_count = 0
+
+                if auto_mode and stable_count >= STABLE_FRAMES:
+                    auto_capture_now = True
+                    stable_count = 0
+            else:
+                stable_count = 0
+                last_m1_center = None
 
             # 表示
             d1 = f1.copy()
@@ -185,40 +229,62 @@ def main():
 
             status_color = (0, 255, 0) if all_detected else (0, 140, 255)
             status = f"{len(common_ids)}/{n_required} common markers"
-            if all_detected:
+            if all_detected and auto_mode:
+                progress = stable_count / STABLE_FRAMES
+                status += f"  -> 静止中 [{int(progress*100)}%]"
+            elif all_detected:
                 status += "  -> SPACE で取得"
             cv2.putText(d1, f"Mac    {len(m1)} detected",
                         (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
             cv2.putText(d2, f"iPhone {len(m2)} detected",
                         (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
+            # 自動取得ゲージ
+            if all_detected and auto_mode:
+                bar_w = int(640 * stable_count / STABLE_FRAMES)
+                cv2.rectangle(d1, (0, 352), (bar_w, 360), (0, 255, 0), -1)
 
             canvas = np.hstack([d1, d2])
             bar = np.zeros((44, canvas.shape[1], 3), dtype=np.uint8)
-            cv2.putText(bar, f"Pairs: {len(obj_pts_all)}/{RECOMMEND}  [{status}]",
-                        (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2)
+            mode_label = "AUTO" if auto_mode else "MANUAL"
+            cv2.putText(bar,
+                        f"Pairs: {len(obj_pts_all)}/{RECOMMEND}  [{mode_label}]  {status}",
+                        (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, status_color, 2)
             canvas = np.vstack([canvas, bar])
             cv2.imshow("ArUco Calibration", canvas)
 
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord("q"):
-                break
-            elif key == ord(" ") and all_detected:
-                # 両カメラ共通のマーカーだけで対応点を作る
+            def capture_pair():
+                nonlocal last_captured_m1_center
                 m1_common = {k: m1[k] for k in common_ids}
                 m2_common = {k: m2[k] for k in common_ids}
                 img_pts1, obj_pts = extract_correspondences(m1_common, markers_3d)
                 img_pts2, _       = extract_correspondences(m2_common, markers_3d)
-
                 obj_pts_all.append(obj_pts.reshape(-1, 1, 3))
                 img_pts1_all.append(img_pts1.reshape(-1, 1, 2))
                 img_pts2_all.append(img_pts2.reshape(-1, 1, 2))
+                last_captured_m1_center = np.mean([m1[i].mean(axis=0) for i in common_ids], axis=0)
                 print(f"  ペア {len(obj_pts_all)} 取得 ({len(obj_pts)}点)")
-
+                # 取得フラッシュ
                 flash = canvas.copy()
                 cv2.rectangle(flash, (0, 0), (canvas.shape[1], canvas.shape[0]),
-                              (0, 255, 0), 8)
+                              (0, 255, 0), 10)
+                cv2.putText(flash, f"CAPTURED {len(obj_pts_all)}",
+                            (flash.shape[1]//2 - 120, flash.shape[0]//2),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 4)
                 cv2.imshow("ArUco Calibration", flash)
-                cv2.waitKey(200)
+                cv2.waitKey(300)
+
+            if auto_capture_now:
+                capture_pair()
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
+                break
+            elif key == ord("a"):
+                auto_mode = not auto_mode
+                stable_count = 0
+                print(f"  モード切替: {'AUTO' if auto_mode else 'MANUAL'}")
+            elif key == ord(" ") and all_detected:
+                capture_pair()
 
             elif key == ord("d") and obj_pts_all:
                 obj_pts_all.pop(); img_pts1_all.pop(); img_pts2_all.pop()
