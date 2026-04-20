@@ -319,6 +319,10 @@ def main():
     captures = {role: [] for role in roles}
     img_sizes = {role: None for role in roles}
 
+    # カバレッジ: 3x3 のどのゾーンでシートを撮ったか（カメラごと）
+    GRID = 3
+    coverage = {role: set() for role in roles}
+
     auto_mode = True
     STABLE_FRAMES = 12
     STILL_THRESHOLD_PX = 3.0
@@ -326,6 +330,27 @@ def main():
     stable_count = 0
     last_center = None
     last_captured_center = None
+
+    def zone_of(x: float, y: float, w: int, h: int) -> tuple[int, int]:
+        return (min(GRID-1, int(x / w * GRID)),
+                min(GRID-1, int(y / h * GRID)))
+
+    def current_zones(role: str) -> set:
+        """今シートが跨っているゾーン集合。"""
+        if role not in detected or not common:
+            return set()
+        w, h = img_sizes[role]
+        zs = set()
+        for mid in common:
+            for (x, y) in detected[role][mid]:
+                zs.add(zone_of(x, y, w, h))
+        return zs
+
+    def coverage_progress() -> tuple[int, int]:
+        """全カメラを合わせたカバレッジ進捗 (covered, total)。"""
+        total = GRID * GRID * len(roles)
+        covered = sum(len(s) for s in coverage.values())
+        return covered, total
 
     print(f"\n必要マーカー: {n_required}個 × 全 {len(roles)} カメラで検出")
     print(f"AUTO=静止で自動取得  a=手動/自動切替  c=キャリブ実行  d=削除  q/ESC=終了")
@@ -355,16 +380,23 @@ def main():
             common &= set(int(k) for k in markers_3d.keys())
             all_detected = len(common) == n_required
 
-            # 自動取得判定（参照カメラの中心を基準）
+            # 自動取得判定（参照カメラ静止 + いずれかカメラで未踏ゾーンを含む）
             auto_capture_now = False
+            new_zone_found = False
             if all_detected:
+                # 現在のカメラ別ゾーン
+                cur_zones = {role: current_zones(role) for role in roles}
+                # 未踏ゾーンを新しく含んでいるか
+                new_zone_found = any(
+                    bool(cur_zones[role] - coverage[role]) for role in roles
+                )
+
                 ref_marker_centers = np.array([detected[reference_role][i].mean(axis=0)
                                                 for i in common])
                 cur_center = ref_marker_centers.mean(axis=0)
                 movement = float(np.linalg.norm(cur_center - last_center)) if last_center is not None else 999.0
-                diff_from_last = float(np.linalg.norm(cur_center - last_captured_center)) if last_captured_center is not None else 999.0
                 last_center = cur_center
-                if movement < STILL_THRESHOLD_PX and diff_from_last > DIFF_THRESHOLD_PX:
+                if movement < STILL_THRESHOLD_PX and new_zone_found:
                     stable_count += 1
                 else:
                     stable_count = 0
@@ -379,19 +411,54 @@ def main():
             tiles = []
             for role in roles:
                 f = frames[role].copy()
+                h, w = f.shape[:2]
+
+                # --- カバレッジグリッド（半透明オーバーレイ）---
+                overlay = f.copy()
+                cur_zs = current_zones(role) if all_detected else set()
+                for zx in range(GRID):
+                    for zy in range(GRID):
+                        x1 = zx * w // GRID
+                        y1 = zy * h // GRID
+                        x2 = (zx + 1) * w // GRID
+                        y2 = (zy + 1) * h // GRID
+                        z = (zx, zy)
+                        if z in cur_zs and z not in coverage[role]:
+                            # 今シートが乗っている未踏ゾーン = 黄
+                            color = (0, 255, 255)
+                            cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
+                        elif z in coverage[role]:
+                            # 撮影済み = 緑
+                            color = (0, 200, 0)
+                            cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
+                        else:
+                            # 未撮影 = 赤薄塗り
+                            color = (0, 0, 120)
+                            cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
+                        cv2.rectangle(f, (x1, y1), (x2, y2), (60, 60, 60), 1)
+                f = cv2.addWeighted(overlay, 0.25, f, 0.75, 0)
+
+                # --- マーカー検出結果 ---
                 for mid, corners in detected[role].items():
                     color = (0, 255, 0) if mid in common else (0, 160, 255)
                     cv2.polylines(f, [corners.astype(np.int32)], True, color, 3)
                     c = corners.mean(axis=0).astype(int)
                     cv2.putText(f, f"#{mid}", tuple(c),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+
+                # --- ラベルと進捗 ---
                 f_small = cv2.resize(f, (480, 270))
                 ref_str = " [REF]" if role == reference_role else ""
-                cv2.putText(f_small, f"{role}{ref_str}  det={len(detected[role])}",
+                cov = len(coverage[role])
+                cv2.putText(f_small,
+                            f"{role}{ref_str}  coverage {cov}/{GRID*GRID}",
                             (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
-                if auto_mode and all_detected:
+                if auto_mode and all_detected and new_zone_found:
                     bar_w = int(480 * stable_count / STABLE_FRAMES)
                     cv2.rectangle(f_small, (0, 265), (bar_w, 270), (0, 255, 0), -1)
+                elif auto_mode and all_detected and not new_zone_found:
+                    cv2.putText(f_small, "すでに撮影済みのゾーン - 移動してください",
+                                (8, 255), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 160, 255), 1)
                 tiles.append(f_small)
 
             # グリッド配置
@@ -432,11 +499,17 @@ def main():
                     )
                     captures[role].append(img_pts.reshape(-1, 1, 2))
 
+                # カバレッジ更新
+                for role in roles:
+                    coverage[role].update(current_zones(role))
+
                 # 生データ保存
                 save_raw_captures(captures, roles, img_sizes, obj_pts_all)
 
                 last_captured_center = cur_center
-                print(f"  ペア {len(obj_pts_all)} 取得 ({len(obj_pts)}点 × {len(roles)}カメラ)")
+                cov_done, cov_total = coverage_progress()
+                print(f"  ペア {len(obj_pts_all)} 取得 ({len(obj_pts)}点 × {len(roles)}カメラ) "
+                      f"カバレッジ {cov_done}/{cov_total}")
                 flash = canvas.copy()
                 cv2.rectangle(flash, (0, 0), (flash.shape[1], flash.shape[0]),
                               (0, 255, 0), 10)
@@ -462,6 +535,13 @@ def main():
                 obj_pts_all.pop()
                 for role in roles:
                     captures[role].pop()
+                # カバレッジを再計算（残りのキャプチャから）
+                for role in roles:
+                    coverage[role] = set()
+                    w, h = img_sizes[role]
+                    for pts in captures[role]:
+                        for (x, y) in pts.reshape(-1, 2):
+                            coverage[role].add(zone_of(float(x), float(y), w, h))
                 print(f"  最後のペアを削除 (残り {len(obj_pts_all)})")
             elif key == ord("c"):
                 if len(obj_pts_all) < MIN_PAIRS:
