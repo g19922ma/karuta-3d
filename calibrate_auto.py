@@ -1,0 +1,271 @@
+"""
+ArUcoシート自動検出によるステレオキャリブレーション
+
+手順:
+    1. generate_calib_sheet.py で calib_sheet.png を生成
+    2. A4で100%印刷、硬い板に貼って平面を保つ
+    3. 両カメラに全マーカーが写るよう置く
+    4. このスクリプトを起動し、シートを様々な角度・位置で見せて SPACE を押す
+    5. 5枚以上集めたら c でキャリブレーション実行
+
+使い方:
+    .venv/bin/python calibrate_auto.py
+
+操作:
+    SPACE : 両カメラで4マーカー全検出ができていたらペアを取得
+    c     : 収集したペアでキャリブレーション実行
+    d     : 最後に追加したペアを削除
+    q     : 終了
+
+推奨:
+    - 10〜15枚のペアで十分な精度
+    - シートの角度・位置・距離を変えながら取得
+    - 極端な斜めより、少しずつ変える方が精度が安定
+"""
+
+import cv2
+import numpy as np
+import json
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(__file__))
+from demo_realtime import CameraThread, CAM_PC, CAM_PHONE
+
+
+META_PATH    = "calib_sheet_meta.json"
+OUTPUT_PATH  = "calibration/stereo_calib.json"
+MIN_PAIRS    = 5
+RECOMMEND    = 10
+
+
+# ---------- ArUco検出 ----------
+
+def setup_detector(meta: dict):
+    """メタから検出器を構築。"""
+    dict_name = meta["aruco_dict"]
+    aruco_dict = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, dict_name))
+    params = cv2.aruco.DetectorParameters()
+    params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+    detector = cv2.aruco.ArucoDetector(aruco_dict, params)
+    return detector
+
+
+def detect_markers(frame: np.ndarray, detector) -> dict:
+    """
+    フレームからArUcoを検出する。
+
+    Returns:
+        {marker_id: corners_np(4, 2)}  全マーカーが検出されなくても見つかった分だけ返す
+    """
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    corners, ids, _ = detector.detectMarkers(gray)
+    result = {}
+    if ids is None:
+        return result
+    for i, mid in enumerate(ids.flatten()):
+        # corners[i]: shape (1, 4, 2), 時計回り（左上→右上→右下→左下）
+        result[int(mid)] = corners[i].reshape(4, 2).astype(np.float64)
+    return result
+
+
+def extract_correspondences(
+    markers: dict,
+    markers_3d: dict,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    検出マーカーと既知3D座標から対応点ペアを作る。
+
+    Returns:
+        img_pts_2d: (N, 2)
+        obj_pts_3d: (N, 3)
+    """
+    img_pts, obj_pts = [], []
+    for mid, corners_2d in markers.items():
+        if str(mid) not in markers_3d:
+            continue
+        corners_3d = np.array(markers_3d[str(mid)], dtype=np.float64)
+        for c2, c3 in zip(corners_2d, corners_3d):
+            img_pts.append(c2)
+            obj_pts.append(c3)
+    return np.array(img_pts, dtype=np.float32), np.array(obj_pts, dtype=np.float32)
+
+
+# ---------- キャリブレーション ----------
+
+def run_calibration(obj_pts, img_pts1, img_pts2, img_size):
+    """個別キャリブ→ステレオキャリブ。"""
+    print(f"\nキャリブレーション実行中... ({len(obj_pts)}ペア)")
+
+    _, K1, d1, _, _ = cv2.calibrateCamera(obj_pts, img_pts1, img_size, None, None)
+    _, K2, d2, _, _ = cv2.calibrateCamera(obj_pts, img_pts2, img_size, None, None)
+
+    rms, _, _, _, _, R, T, E, F = cv2.stereoCalibrate(
+        obj_pts, img_pts1, img_pts2,
+        K1, d1, K2, d2,
+        img_size,
+        flags=cv2.CALIB_FIX_INTRINSIC,
+    )
+
+    return {
+        "K1": K1.tolist(),
+        "K2": K2.tolist(),
+        "dist1": d1.tolist(),
+        "dist2": d2.tolist(),
+        "R": R.tolist(),
+        "T": T.tolist(),
+        "image_size": img_size,
+        "n_images": len(obj_pts),
+        "rms_error": round(rms, 4),
+        "method": "aruco_sheet",
+    }
+
+
+# ---------- メイン ----------
+
+def main():
+    if not os.path.exists(META_PATH):
+        print(f"{META_PATH} がありません。先に generate_calib_sheet.py を実行してください。")
+        sys.exit(1)
+
+    with open(META_PATH) as f:
+        meta = json.load(f)
+
+    detector = setup_detector(meta)
+    markers_3d = meta["markers_3d"]
+    n_required = len(markers_3d)
+
+    cam_pc    = CameraThread(CAM_PC,    "Mac")
+    cam_phone = CameraThread(CAM_PHONE, "Phone")
+    cam_pc.start(); cam_phone.start()
+    time.sleep(1.0)
+
+    print(f"=== ArUcoシート自動キャリブレーション ===")
+    print(f"必要マーカー: {n_required}個（全部見えた時だけペアを取れます）")
+    print(f"SPACE=取得  c=キャリブ実行  d=削除  q=終了")
+    print(f"目標: {RECOMMEND}ペア\n")
+
+    obj_pts_all, img_pts1_all, img_pts2_all = [], [], []
+    img_size = None
+
+    try:
+        while True:
+            f1 = cam_pc.get_frame()
+            f2 = cam_phone.get_frame()
+            if f1 is None or f2 is None:
+                time.sleep(0.01); continue
+
+            if img_size is None:
+                img_size = (f1.shape[1], f1.shape[0])
+
+            m1 = detect_markers(f1, detector)
+            m2 = detect_markers(f2, detector)
+
+            # 両カメラで検出された共通のマーカーID
+            common_ids = set(m1.keys()) & set(m2.keys()) & set(int(k) for k in markers_3d.keys())
+            all_detected = len(common_ids) == n_required
+
+            # 表示
+            d1 = f1.copy()
+            d2 = f2.copy()
+            for mid, corners in m1.items():
+                color = (0, 255, 0) if mid in common_ids else (0, 200, 255)
+                cv2.polylines(d1, [corners.astype(np.int32)], True, color, 2)
+                c = corners.mean(axis=0).astype(int)
+                cv2.putText(d1, f"#{mid}", tuple(c), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+            for mid, corners in m2.items():
+                color = (0, 255, 0) if mid in common_ids else (0, 200, 255)
+                cv2.polylines(d2, [corners.astype(np.int32)], True, color, 2)
+                c = corners.mean(axis=0).astype(int)
+                cv2.putText(d2, f"#{mid}", tuple(c), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+
+            d1 = cv2.resize(d1, (640, 360))
+            d2 = cv2.resize(d2, (640, 360))
+
+            status_color = (0, 255, 0) if all_detected else (0, 140, 255)
+            status = f"{len(common_ids)}/{n_required} common markers"
+            if all_detected:
+                status += "  -> SPACE で取得"
+            cv2.putText(d1, f"Mac    {len(m1)} detected",
+                        (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
+            cv2.putText(d2, f"iPhone {len(m2)} detected",
+                        (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
+
+            canvas = np.hstack([d1, d2])
+            bar = np.zeros((44, canvas.shape[1], 3), dtype=np.uint8)
+            cv2.putText(bar, f"Pairs: {len(obj_pts_all)}/{RECOMMEND}  [{status}]",
+                        (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2)
+            canvas = np.vstack([canvas, bar])
+            cv2.imshow("ArUco Calibration", canvas)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
+                break
+            elif key == ord(" ") and all_detected:
+                # 両カメラ共通のマーカーだけで対応点を作る
+                m1_common = {k: m1[k] for k in common_ids}
+                m2_common = {k: m2[k] for k in common_ids}
+                img_pts1, obj_pts = extract_correspondences(m1_common, markers_3d)
+                img_pts2, _       = extract_correspondences(m2_common, markers_3d)
+
+                obj_pts_all.append(obj_pts.reshape(-1, 1, 3))
+                img_pts1_all.append(img_pts1.reshape(-1, 1, 2))
+                img_pts2_all.append(img_pts2.reshape(-1, 1, 2))
+                print(f"  ペア {len(obj_pts_all)} 取得 ({len(obj_pts)}点)")
+
+                flash = canvas.copy()
+                cv2.rectangle(flash, (0, 0), (canvas.shape[1], canvas.shape[0]),
+                              (0, 255, 0), 8)
+                cv2.imshow("ArUco Calibration", flash)
+                cv2.waitKey(200)
+
+            elif key == ord("d") and obj_pts_all:
+                obj_pts_all.pop(); img_pts1_all.pop(); img_pts2_all.pop()
+                print(f"  最後のペアを削除 (残り {len(obj_pts_all)})")
+
+            elif key == ord("c"):
+                if len(obj_pts_all) < MIN_PAIRS:
+                    print(f"  ペア不足: {len(obj_pts_all)}/{MIN_PAIRS}")
+                    continue
+                cv2.destroyAllWindows()
+
+                result = run_calibration(
+                    obj_pts_all, img_pts1_all, img_pts2_all, img_size
+                )
+
+                os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
+                with open(OUTPUT_PATH, "w") as f:
+                    json.dump(result, f, indent=2)
+
+                # シート位置を card_positions.json 相当として保存（3Dビューで見られる）
+                sheet_corners = []
+                for mid, corners_3d in sorted(markers_3d.items(), key=lambda x: int(x[0])):
+                    sheet_corners.append({
+                        "id": int(mid),
+                        "corners": corners_3d,
+                    })
+                with open("calibration/card_positions.json", "w") as f:
+                    json.dump({
+                        "cards": sheet_corners,
+                        "note": "ArUco markers from calib sheet (not actual karuta cards)"
+                    }, f, indent=2)
+
+                print(f"\n保存: {OUTPUT_PATH}")
+                print(f"RMS再投影誤差: {result['rms_error']:.4f} px")
+                if result["rms_error"] < 1.0:
+                    print("  ✓ 非常に良好")
+                elif result["rms_error"] < 3.0:
+                    print("  ✓ 良好")
+                else:
+                    print("  ⚠ やや大きい。シートを平らに保つ・枚数を増やすと改善")
+                print("\ndemo_realtime/demo_live 再起動で自動適用されます。")
+                break
+
+    finally:
+        cam_pc.stop(); cam_phone.stop()
+        cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
