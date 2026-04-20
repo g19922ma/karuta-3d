@@ -117,18 +117,23 @@ def calibrate_stereo(obj_pts, img_pts_a, img_pts_b, K_a, d_a, K_b, d_b, img_size
 def save_raw_captures(captures: dict, roles: list[str],
                        img_sizes: dict, obj_pts_all: list, path: str = RAW_DATA_PATH):
     """
-    captures: {role: [img_pts_array, ...]}  各キャプチャでのカメラ別2D点
-    obj_pts_all: [obj_pts, ...]             共通の3D点（各キャプチャ）
+    captures[role][i] は (img_pts) または None（そのキャプチャでカメラが未検出）。
+    obj_pts_all[i] は常に同じ3D点（共通の物理平面）。
     """
     os.makedirs(os.path.dirname(path), exist_ok=True)
     save_dict = {
-        "roles": np.array(roles),
+        "roles":   np.array(roles),
         "obj_pts": np.array([p.reshape(-1, 3) for p in obj_pts_all], dtype=object),
     }
     for role in roles:
-        save_dict[f"img_pts_{role}"] = np.array(
-            [p.reshape(-1, 2) for p in captures[role]], dtype=object
-        )
+        # None は shape (0, 2) の空配列にする（復元時に識別可）
+        arr = []
+        for p in captures[role]:
+            if p is None:
+                arr.append(np.zeros((0, 2), dtype=np.float32))
+            else:
+                arr.append(p.reshape(-1, 2))
+        save_dict[f"img_pts_{role}"] = np.array(arr, dtype=object)
         save_dict[f"size_{role}"] = np.array(img_sizes[role])
     np.savez(path, **save_dict)
 
@@ -140,10 +145,14 @@ def load_raw_captures(path: str = RAW_DATA_PATH):
     captures = {}
     img_sizes = {}
     for role in roles:
-        captures[role] = [
-            np.asarray(p, dtype=np.float32).reshape(-1, 1, 2)
-            for p in data[f"img_pts_{role}"]
-        ]
+        raw = data[f"img_pts_{role}"]
+        captures[role] = []
+        for p in raw:
+            arr = np.asarray(p, dtype=np.float32)
+            if arr.shape[0] == 0:
+                captures[role].append(None)   # 未検出
+            else:
+                captures[role].append(arr.reshape(-1, 1, 2))
         img_sizes[role] = tuple(int(x) for x in data[f"size_{role}"])
     return roles, obj_pts_all, captures, img_sizes
 
@@ -157,46 +166,75 @@ def compute_all(roles: list[str], obj_pts_all: list,
                  reference_role: str) -> dict:
     """
     各カメラの内部パラメータ + 参照カメラからの外部パラメータを計算。
-    """
-    print(f"\n=== キャリブレーション計算 ({len(obj_pts_all)}ペア) ===\n")
 
+    captures[role][i] は None 可能（そのキャプチャでこのカメラが未検出）。
+    内部計算は各カメラが有効なキャプチャだけを使う。
+    外部計算は両カメラが同時に有効なキャプチャだけを使う。
+    """
+    print(f"\n=== キャリブレーション計算 (total {len(obj_pts_all)} キャプチャ) ===\n")
+
+    # --- 内部パラメータ: 各カメラが見えているキャプチャだけ使う ---
     intrinsics = {}
     for role in roles:
-        img_pts = captures[role]
+        valid_indices = [i for i, p in enumerate(captures[role]) if p is not None]
+        if len(valid_indices) < 3:
+            print(f"[{role}] 有効キャプチャ不足: {len(valid_indices)}（最低3）")
+            raise RuntimeError(f"{role} の内部キャリブに十分なデータがありません")
+        img_pts_valid = [captures[role][i] for i in valid_indices]
+        obj_pts_valid = [obj_pts_all[i]    for i in valid_indices]
+
         size = img_sizes[role]
-        rms, K, dist = calibrate_intrinsics(obj_pts_all, img_pts, size)
+        rms, K, dist = calibrate_intrinsics(obj_pts_valid, img_pts_valid, size)
         intrinsics[role] = {
             "K":          K.tolist(),
             "dist":       dist.tolist(),
             "image_size": list(size),
             "rms":        round(float(rms), 4),
+            "n_captures": len(valid_indices),
         }
-        print(f"[{role}] {size}  RMS={rms:.3f}px  "
+        print(f"[{role}] n={len(valid_indices)} 画像サイズ={size}  RMS={rms:.3f}px  "
               f"fx={K[0,0]:.0f} fy={K[1,1]:.0f} cx={K[0,2]:.0f} cy={K[1,2]:.0f}")
 
     print()
 
-    # 外部パラメータ: 参照カメラを原点（R=I, T=0）、他は参照からの相対
-    extrinsics = {reference_role: {"R": np.eye(3).tolist(), "T": [0, 0, 0], "rms": 0.0}}
+    # --- 外部パラメータ: 参照との同時検出キャプチャだけ使う ---
+    extrinsics = {reference_role: {"R": np.eye(3).tolist(), "T": [0, 0, 0], "rms": 0.0,
+                                    "n_captures": 0}}
     for role in roles:
         if role == reference_role:
             continue
+
+        # 両方が同時に見えたキャプチャだけ
+        shared_indices = [
+            i for i in range(len(obj_pts_all))
+            if captures[reference_role][i] is not None and captures[role][i] is not None
+        ]
+        if len(shared_indices) < 3:
+            print(f"[{reference_role} -> {role}] 共通キャプチャ不足: {len(shared_indices)}")
+            extrinsics[role] = {"error": f"共通キャプチャ {len(shared_indices)} 件（最低3）"}
+            continue
+
+        img_pts_ref   = [captures[reference_role][i] for i in shared_indices]
+        img_pts_this  = [captures[role][i]           for i in shared_indices]
+        obj_pts_shared = [obj_pts_all[i]             for i in shared_indices]
+
         K_ref  = np.array(intrinsics[reference_role]["K"])
         d_ref  = np.array(intrinsics[reference_role]["dist"])
         K_this = np.array(intrinsics[role]["K"])
         d_this = np.array(intrinsics[role]["dist"])
+
         rms, R, T = calibrate_stereo(
-            obj_pts_all,
-            captures[reference_role], captures[role],
+            obj_pts_shared, img_pts_ref, img_pts_this,
             K_ref, d_ref, K_this, d_this,
             img_sizes[reference_role],
         )
         extrinsics[role] = {
-            "R":   R.tolist(),
-            "T":   T.tolist(),
-            "rms": round(float(rms), 4),
+            "R":          R.tolist(),
+            "T":          T.tolist(),
+            "rms":        round(float(rms), 4),
+            "n_captures": len(shared_indices),
         }
-        print(f"[{reference_role} -> {role}] ステレオRMS={rms:.3f}px")
+        print(f"[{reference_role} -> {role}] n={len(shared_indices)} ステレオRMS={rms:.3f}px")
 
     return {
         "version":         2,
@@ -336,14 +374,17 @@ def main():
                 min(GRID-1, int(y / h * GRID)))
 
     def current_zones(role: str) -> set:
-        """今シートが跨っているゾーン集合。"""
-        if role not in detected or not common:
+        """今シートが跨っているゾーン集合（このカメラが全マーカー検出時）。"""
+        if img_sizes[role] is None:
+            return set()
+        if role not in detected or not mono_ok.get(role, False):
             return set()
         w, h = img_sizes[role]
         zs = set()
-        for mid in common:
-            for (x, y) in detected[role][mid]:
-                zs.add(zone_of(x, y, w, h))
+        for mid in all_ids:
+            if mid in detected[role]:
+                for (x, y) in detected[role][mid]:
+                    zs.add(zone_of(x, y, w, h))
         return zs
 
     def coverage_progress() -> tuple[int, int]:
@@ -373,39 +414,64 @@ def main():
             # 各カメラでArUco検出
             detected = {role: detect_markers(frames[role], detector) for role in roles}
 
-            # 全カメラで検出された共通ID
-            common = set(detected[roles[0]].keys())
-            for role in roles[1:]:
-                common &= set(detected[role].keys())
-            common &= set(int(k) for k in markers_3d.keys())
-            all_detected = len(common) == n_required
+            # 各カメラが全マーカーを検出したか（単独検出）
+            all_ids = set(int(k) for k in markers_3d.keys())
+            mono_ok = {
+                role: len(set(detected[role].keys()) & all_ids) == n_required
+                for role in roles
+            }
+            # 2カメラ以上で同時検出できているもの（ステレオ可能）
+            multi_ok_roles = [r for r in roles if mono_ok[r]]
+            common = all_ids if len(multi_ok_roles) >= 2 else set()
+            all_detected = any(mono_ok.values())
 
-            # 自動取得判定（参照カメラ静止 + いずれかカメラで未踏ゾーンを含む）
+            # 自動取得判定: どこか1台でも全マーカー検出 + 静止 + 未踏ゾーン
             auto_capture_now = False
             new_zone_found = False
-            if all_detected:
-                # 現在のカメラ別ゾーン
-                cur_zones = {role: current_zones(role) for role in roles}
-                # 未踏ゾーンを新しく含んでいるか
-                new_zone_found = any(
-                    bool(cur_zones[role] - coverage[role]) for role in roles
-                )
+            status_msg = ""
+            cur_center = None
 
-                ref_marker_centers = np.array([detected[reference_role][i].mean(axis=0)
-                                                for i in common])
-                cur_center = ref_marker_centers.mean(axis=0)
+            if all_detected:
+                # 未踏ゾーンを新しく含んでいるカメラがあるか
+                cur_zones = {
+                    role: (current_zones(role) if mono_ok[role] else set())
+                    for role in roles
+                }
+                new_zones_per_cam = {
+                    role: cur_zones[role] - coverage[role] for role in roles
+                }
+                new_zone_found = any(bool(v) for v in new_zones_per_cam.values())
+
+                # 静止判定: 全有効カメラの中心を平均したもの
+                centers = []
+                for r in roles:
+                    if mono_ok[r]:
+                        marker_centers = [detected[r][i].mean(axis=0) for i in all_ids]
+                        centers.append(np.mean(marker_centers, axis=0))
+                cur_center = np.mean(centers, axis=0)
+
                 movement = float(np.linalg.norm(cur_center - last_center)) if last_center is not None else 999.0
                 last_center = cur_center
+
                 if movement < STILL_THRESHOLD_PX and new_zone_found:
                     stable_count += 1
+                    status_msg = f"静止確認中 {stable_count}/{STABLE_FRAMES}"
                 else:
                     stable_count = 0
+                    if movement >= STILL_THRESHOLD_PX:
+                        status_msg = "動いてます"
+                    elif not new_zone_found:
+                        status_msg = "新しいゾーンへ移動してください"
+
                 if auto_mode and stable_count >= STABLE_FRAMES:
                     auto_capture_now = True
                     stable_count = 0
             else:
                 stable_count = 0
                 last_center = None
+                # なぜ検出できていないかを表示
+                missing = [r for r in roles if not mono_ok[r]]
+                status_msg = f"マーカー検出不足: {', '.join(missing)}"
 
             # 表示
             tiles = []
@@ -471,37 +537,46 @@ def main():
                 grid_rows.append(np.hstack(tiles[r * cols:(r + 1) * cols]))
             canvas = np.vstack(grid_rows)
 
-            bar = np.zeros((40, canvas.shape[1], 3), dtype=np.uint8)
+            bar = np.zeros((56, canvas.shape[1], 3), dtype=np.uint8)
             mode = "AUTO" if auto_mode else "MANUAL"
-            stat_c = (0, 255, 0) if all_detected else (0, 140, 255)
+            stat_c = (0, 255, 0) if auto_capture_now else ((0, 220, 220) if all_detected else (0, 120, 255))
+            # 1行目: 進捗
+            cov_totals = [f"{r}:{len(coverage[r])}/{GRID*GRID}" for r in roles]
             cv2.putText(bar,
-                        f"Pairs: {len(obj_pts_all)}/{RECOMMEND}  [{mode}]  "
-                        f"common={len(common)}/{n_required}",
-                        (10, 27), cv2.FONT_HERSHEY_SIMPLEX, 0.6, stat_c, 2)
+                        f"[{mode}] caps={len(obj_pts_all)}  " +
+                        "  ".join(cov_totals),
+                        (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 220, 255), 2)
+            # 2行目: 状況メッセージ
+            cv2.putText(bar, status_msg,
+                        (10, 46), cv2.FONT_HERSHEY_SIMPLEX, 0.55, stat_c, 2)
             canvas = np.vstack([canvas, bar])
             cv2.imshow(win, canvas)
 
             def do_capture():
                 nonlocal last_captured_center
-                # 最初のキャプチャで3D点が確定する
-                any_role = next(iter(common))
-                # obj_pts は全カメラ共通。ここでは参照カメラの検出から抽出
-                img_pts_ref, obj_pts = extract_correspondences(
-                    {k: detected[reference_role][k] for k in common},
+                # 3D点は any_roleの検出から抽出（マーカーIDごとに3D位置は固定）
+                first_ok = next(r for r in roles if mono_ok[r])
+                _, obj_pts = extract_correspondences(
+                    {k: detected[first_ok][k] for k in all_ids if k in detected[first_ok]},
                     markers_3d
                 )
                 obj_pts_all.append(obj_pts.reshape(-1, 1, 3))
 
+                # 各カメラごとに検出できてれば記録、なければ None
                 for role in roles:
-                    img_pts, _ = extract_correspondences(
-                        {k: detected[role][k] for k in common},
-                        markers_3d
-                    )
-                    captures[role].append(img_pts.reshape(-1, 1, 2))
+                    if mono_ok[role]:
+                        img_pts, _ = extract_correspondences(
+                            {k: detected[role][k] for k in all_ids},
+                            markers_3d
+                        )
+                        captures[role].append(img_pts.reshape(-1, 1, 2))
+                    else:
+                        captures[role].append(None)
 
-                # カバレッジ更新
+                # カバレッジ更新（検出できたカメラだけ）
                 for role in roles:
-                    coverage[role].update(current_zones(role))
+                    if mono_ok[role]:
+                        coverage[role].update(current_zones(role))
 
                 # 生データ保存
                 save_raw_captures(captures, roles, img_sizes, obj_pts_all)
@@ -540,9 +615,11 @@ def main():
                     coverage[role] = set()
                     w, h = img_sizes[role]
                     for pts in captures[role]:
+                        if pts is None:
+                            continue
                         for (x, y) in pts.reshape(-1, 2):
                             coverage[role].add(zone_of(float(x), float(y), w, h))
-                print(f"  最後のペアを削除 (残り {len(obj_pts_all)})")
+                print(f"  最後のキャプチャを削除 (残り {len(obj_pts_all)})")
             elif key == ord("c"):
                 if len(obj_pts_all) < MIN_PAIRS:
                     print(f"  ペア不足: {len(obj_pts_all)}/{MIN_PAIRS}")
