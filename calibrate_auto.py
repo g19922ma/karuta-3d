@@ -94,19 +94,35 @@ def extract_correspondences(
 
 # ---------- キャリブレーション ----------
 
-def run_calibration(obj_pts, img_pts1, img_pts2, img_size):
+def run_calibration(obj_pts, img_pts1, img_pts2, img_size1, img_size2):
     """個別キャリブ→ステレオキャリブ。"""
     print(f"\nキャリブレーション実行中... ({len(obj_pts)}ペア)")
+    print(f"  カメラ1画像サイズ: {img_size1}")
+    print(f"  カメラ2画像サイズ: {img_size2}")
 
-    _, K1, d1, _, _ = cv2.calibrateCamera(obj_pts, img_pts1, img_size, None, None)
-    _, K2, d2, _, _ = cv2.calibrateCamera(obj_pts, img_pts2, img_size, None, None)
+    # 歪みモデルを単純化（平面ターゲット + 少数キャプチャでの発散を防止）
+    flags = (cv2.CALIB_ZERO_TANGENT_DIST |
+             cv2.CALIB_FIX_K2 |
+             cv2.CALIB_FIX_K3)
 
+    rms1, K1, d1, _, _ = cv2.calibrateCamera(
+        obj_pts, img_pts1, img_size1, None, None, flags=flags
+    )
+    rms2, K2, d2, _, _ = cv2.calibrateCamera(
+        obj_pts, img_pts2, img_size2, None, None, flags=flags
+    )
+    print(f"  個別RMS  Cam1={rms1:.3f}px  Cam2={rms2:.3f}px")
+    print(f"  Cam1 焦点 fx={K1[0,0]:.0f} fy={K1[1,1]:.0f}  中心 cx={K1[0,2]:.0f} cy={K1[1,2]:.0f}")
+    print(f"  Cam2 焦点 fx={K2[0,0]:.0f} fy={K2[1,1]:.0f}  中心 cx={K2[0,2]:.0f} cy={K2[1,2]:.0f}")
+
+    # ステレオキャリブレーションは imageSize を使わないが、API上必須
     rms, _, _, _, _, R, T, E, F = cv2.stereoCalibrate(
         obj_pts, img_pts1, img_pts2,
         K1, d1, K2, d2,
-        img_size,
+        img_size1,
         flags=cv2.CALIB_FIX_INTRINSIC,
     )
+    print(f"  ステレオRMS = {rms:.3f}px")
 
     return {
         "K1": K1.tolist(),
@@ -115,9 +131,13 @@ def run_calibration(obj_pts, img_pts1, img_pts2, img_size):
         "dist2": d2.tolist(),
         "R": R.tolist(),
         "T": T.tolist(),
-        "image_size": img_size,
+        "image_size":  img_size1,    # 旧API互換
+        "image_size1": img_size1,
+        "image_size2": img_size2,
         "n_images": len(obj_pts),
         "rms_error": round(rms, 4),
+        "rms_cam1":  round(rms1, 4),
+        "rms_cam2":  round(rms2, 4),
         "method": "aruco_sheet",
     }
 
@@ -147,7 +167,8 @@ def main():
     print(f"目標: {RECOMMEND}ペア\n")
 
     obj_pts_all, img_pts1_all, img_pts2_all = [], [], []
-    img_size = None
+    img_size1 = None
+    img_size2 = None
 
     # 自動取得モード（デフォルトON）
     auto_mode = True
@@ -168,8 +189,11 @@ def main():
             if f1 is None or f2 is None:
                 time.sleep(0.01); continue
 
-            if img_size is None:
-                img_size = (f1.shape[1], f1.shape[0])
+            if img_size1 is None:
+                img_size1 = (f1.shape[1], f1.shape[0])
+                img_size2 = (f2.shape[1], f2.shape[0])
+                if img_size1 != img_size2:
+                    print(f"  注意: 解像度が異なります Cam1={img_size1} Cam2={img_size2}")
 
             m1 = detect_markers(f1, detector)
             m2 = detect_markers(f2, detector)
@@ -277,7 +301,7 @@ def main():
                 capture_pair()
 
             key = cv2.waitKey(1) & 0xFF
-            if key == ord("q"):
+            if key == ord("q") or key == 27:   # q or ESC
                 break
             elif key == ord("a"):
                 auto_mode = not auto_mode
@@ -297,7 +321,8 @@ def main():
                 cv2.destroyAllWindows()
 
                 result = run_calibration(
-                    obj_pts_all, img_pts1_all, img_pts2_all, img_size
+                    obj_pts_all, img_pts1_all, img_pts2_all,
+                    img_size1, img_size2
                 )
 
                 os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
