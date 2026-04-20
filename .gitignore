@@ -1,2 +1,3 @@
 *.task
 calib_sheet.png
+calibration/raw_captures.npz

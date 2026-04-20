@@ -29,15 +29,17 @@ import json
 import os
 import sys
 import time
+import argparse
 
 sys.path.insert(0, os.path.dirname(__file__))
 from demo_realtime import CameraThread, CAM_PC, CAM_PHONE
 
 
-META_PATH    = "calib_sheet_meta.json"
-OUTPUT_PATH  = "calibration/stereo_calib.json"
-MIN_PAIRS    = 5
-RECOMMEND    = 10
+META_PATH      = "calib_sheet_meta.json"
+OUTPUT_PATH    = "calibration/stereo_calib.json"
+RAW_DATA_PATH  = "calibration/raw_captures.npz"   # 生データ（再計算用）
+MIN_PAIRS      = 5
+RECOMMEND      = 10
 
 
 # ---------- ArUco検出 ----------
@@ -142,9 +144,74 @@ def run_calibration(obj_pts, img_pts1, img_pts2, img_size1, img_size2):
     }
 
 
+# ---------- 生データの保存・読み込み ----------
+
+def save_raw_captures(obj_pts_all, img_pts1_all, img_pts2_all,
+                       img_size1, img_size2, path: str = RAW_DATA_PATH):
+    """キャプチャの生データを npz に保存する（再計算用）。"""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    np.savez(
+        path,
+        obj_pts=np.array([p.reshape(-1, 3) for p in obj_pts_all], dtype=object),
+        img_pts1=np.array([p.reshape(-1, 2) for p in img_pts1_all], dtype=object),
+        img_pts2=np.array([p.reshape(-1, 2) for p in img_pts2_all], dtype=object),
+        img_size1=np.array(img_size1),
+        img_size2=np.array(img_size2),
+    )
+
+
+def load_raw_captures(path: str = RAW_DATA_PATH):
+    """保存された生データを読み込む。"""
+    data = np.load(path, allow_pickle=True)
+    obj_pts_all  = [np.asarray(p, dtype=np.float32).reshape(-1, 1, 3)
+                    for p in data["obj_pts"]]
+    img_pts1_all = [np.asarray(p, dtype=np.float32).reshape(-1, 1, 2)
+                    for p in data["img_pts1"]]
+    img_pts2_all = [np.asarray(p, dtype=np.float32).reshape(-1, 1, 2)
+                    for p in data["img_pts2"]]
+    img_size1 = tuple(int(x) for x in data["img_size1"])
+    img_size2 = tuple(int(x) for x in data["img_size2"])
+    return obj_pts_all, img_pts1_all, img_pts2_all, img_size1, img_size2
+
+
 # ---------- メイン ----------
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--recompute", action="store_true",
+                        help="前回保存した生データから再計算（撮影しない）")
+    args = parser.parse_args()
+
+    # 再計算モード
+    if args.recompute:
+        if not os.path.exists(RAW_DATA_PATH):
+            print(f"{RAW_DATA_PATH} がありません。一度通常モードで取得してください。")
+            sys.exit(1)
+        print(f"=== 再計算モード ===")
+        print(f"生データ読み込み: {RAW_DATA_PATH}")
+        obj_pts_all, img_pts1_all, img_pts2_all, img_size1, img_size2 = load_raw_captures()
+        print(f"  {len(obj_pts_all)} ペア")
+
+        result = run_calibration(obj_pts_all, img_pts1_all, img_pts2_all,
+                                  img_size1, img_size2)
+        os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
+        with open(OUTPUT_PATH, "w") as f:
+            json.dump(result, f, indent=2)
+
+        # シート位置も保存
+        with open(META_PATH) as f:
+            meta = json.load(f)
+        sheet_corners = []
+        for mid, corners_3d in sorted(meta["markers_3d"].items(), key=lambda x: int(x[0])):
+            sheet_corners.append({"id": int(mid), "corners": corners_3d})
+        with open("calibration/card_positions.json", "w") as f:
+            json.dump({"cards": sheet_corners,
+                        "note": "ArUco markers from calib sheet"}, f, indent=2)
+
+        print(f"\n保存: {OUTPUT_PATH}")
+        print(f"ステレオRMS: {result['rms_error']:.4f} px")
+        return
+
     if not os.path.exists(META_PATH):
         print(f"{META_PATH} がありません。先に generate_calib_sheet.py を実行してください。")
         sys.exit(1)
@@ -286,6 +353,9 @@ def main():
                 img_pts1_all.append(img_pts1.reshape(-1, 1, 2))
                 img_pts2_all.append(img_pts2.reshape(-1, 1, 2))
                 last_captured_m1_center = np.mean([m1[i].mean(axis=0) for i in common_ids], axis=0)
+                # 生データを毎回保存（落ちても大丈夫なように）
+                save_raw_captures(obj_pts_all, img_pts1_all, img_pts2_all,
+                                   img_size1, img_size2)
                 print(f"  ペア {len(obj_pts_all)} 取得 ({len(obj_pts)}点)")
                 # 取得フラッシュ
                 flash = canvas.copy()
