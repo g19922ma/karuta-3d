@@ -85,18 +85,36 @@ def _init_intrinsic_matrix(img_size: tuple) -> np.ndarray:
 
 
 def calibrate_intrinsics(obj_pts, img_pts, img_size):
-    """単一カメラの内部パラメータを推定。"""
+    """単一カメラの内部パラメータを推定。
+    収束しない/異常値の場合は初期値（fx = image_width）にフォールバックする。
+    戻り値: (rms, K, dist, used_fallback)
+    """
     flags = (cv2.CALIB_USE_INTRINSIC_GUESS |
-             cv2.CALIB_FIX_PRINCIPAL_POINT |   # 主点は画像中心に固定（広角補正済みカメラで妥当）
+             cv2.CALIB_FIX_PRINCIPAL_POINT |   # 主点は画像中心に固定
              cv2.CALIB_FIX_ASPECT_RATIO |      # fx = fy
              cv2.CALIB_ZERO_TANGENT_DIST |
              cv2.CALIB_FIX_K2 |
              cv2.CALIB_FIX_K3)
-    K_init = _init_intrinsic_matrix(img_size)
-    rms, K, dist, _, _ = cv2.calibrateCamera(
-        obj_pts, img_pts, img_size, K_init, None, flags=flags
-    )
-    return rms, K, dist
+    expected_fx = img_size[0]
+
+    try:
+        # cv2.calibrateCamera は K を破壊的に書き換えるので、
+        # 呼び出し用と「フォールバック用」の初期値を別々に保持する
+        K_for_calib = _init_intrinsic_matrix(img_size)
+        rms, K, dist, _, _ = cv2.calibrateCamera(
+            obj_pts, img_pts, img_size, K_for_calib, None, flags=flags
+        )
+        fx = K[0, 0]
+        if fx < expected_fx / 3 or fx > expected_fx * 3:
+            print(f"  警告: fx={fx:.0f} が期待値{expected_fx}から大きく外れる → 初期値使用")
+            return 0.0, _init_intrinsic_matrix(img_size), np.zeros(5, dtype=np.float64), True
+        if rms > 30.0:
+            print(f"  警告: RMS={rms:.1f}px が大きすぎる → 初期値使用")
+            return 0.0, _init_intrinsic_matrix(img_size), np.zeros(5, dtype=np.float64), True
+        return rms, K, dist, False
+    except cv2.error as e:
+        print(f"  キャリブ失敗 → 初期値使用: {e}")
+        return 0.0, _init_intrinsic_matrix(img_size), np.zeros(5, dtype=np.float64), True
 
 
 def calibrate_stereo(obj_pts, img_pts_a, img_pts_b, K_a, d_a, K_b, d_b, img_size_a):
@@ -184,15 +202,17 @@ def compute_all(roles: list[str], obj_pts_all: list,
         obj_pts_valid = [obj_pts_all[i]    for i in valid_indices]
 
         size = img_sizes[role]
-        rms, K, dist = calibrate_intrinsics(obj_pts_valid, img_pts_valid, size)
+        rms, K, dist, fallback = calibrate_intrinsics(obj_pts_valid, img_pts_valid, size)
         intrinsics[role] = {
             "K":          K.tolist(),
             "dist":       dist.tolist(),
             "image_size": list(size),
             "rms":        round(float(rms), 4),
             "n_captures": len(valid_indices),
+            "used_fallback": fallback,
         }
-        print(f"[{role}] n={len(valid_indices)} 画像サイズ={size}  RMS={rms:.3f}px  "
+        tag = " [FALLBACK]" if fallback else ""
+        print(f"[{role}]{tag} n={len(valid_indices)} 画像サイズ={size}  RMS={rms:.3f}px  "
               f"fx={K[0,0]:.0f} fy={K[1,1]:.0f} cx={K[0,2]:.0f} cy={K[1,2]:.0f}")
 
     print()
@@ -209,9 +229,10 @@ def compute_all(roles: list[str], obj_pts_all: list,
             i for i in range(len(obj_pts_all))
             if captures[reference_role][i] is not None and captures[role][i] is not None
         ]
-        if len(shared_indices) < 3:
+        if len(shared_indices) < 2:
             print(f"[{reference_role} -> {role}] 共通キャプチャ不足: {len(shared_indices)}")
-            extrinsics[role] = {"error": f"共通キャプチャ {len(shared_indices)} 件（最低3）"}
+            extrinsics[role] = {"error": f"共通キャプチャ {len(shared_indices)} 件（最低2）",
+                                 "n_captures": len(shared_indices)}
             continue
 
         img_pts_ref   = [captures[reference_role][i] for i in shared_indices]
@@ -252,23 +273,28 @@ def save_result(result: dict):
         json.dump(result, f, indent=2)
     print(f"\n保存: {OUTPUT_PATH}")
 
-    # 旧形式互換（2カメラの場合のみ）
+    # 旧形式互換（2カメラ + 外部キャリブ成功時のみ）
     roles = result["camera_roles"]
     if len(roles) == 2:
         ref = result["reference"]
         other = [r for r in roles if r != ref][0]
+        ext = result["extrinsics"].get(other, {})
+        if "R" not in ext or "T" not in ext:
+            print(f"  警告: 外部キャリブが失敗しているため {LEGACY_PATH} は更新しません")
+            print(f"       理由: {ext.get('error', '不明')}")
+            return
         legacy = {
             "K1":          result["intrinsics"][ref]["K"],
             "K2":          result["intrinsics"][other]["K"],
             "dist1":       result["intrinsics"][ref]["dist"],
             "dist2":       result["intrinsics"][other]["dist"],
-            "R":           result["extrinsics"][other]["R"],
-            "T":           result["extrinsics"][other]["T"],
+            "R":           ext["R"],
+            "T":           ext["T"],
             "image_size":  result["intrinsics"][ref]["image_size"],
             "image_size1": result["intrinsics"][ref]["image_size"],
             "image_size2": result["intrinsics"][other]["image_size"],
-            "n_images":    0,   # 新形式に記録
-            "rms_error":   result["extrinsics"][other]["rms"],
+            "n_images":    ext.get("n_captures", 0),
+            "rms_error":   ext["rms"],
             "rms_cam1":    result["intrinsics"][ref]["rms"],
             "rms_cam2":    result["intrinsics"][other]["rms"],
             "method":      "aruco_sheet_v2",
