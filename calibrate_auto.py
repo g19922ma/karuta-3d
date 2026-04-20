@@ -1,26 +1,20 @@
 """
-ArUcoシート自動検出によるステレオキャリブレーション
+ArUcoシート自動検出による N カメラ ステレオキャリブレーション
+
+cameras_config.json で定義されたカメラ全台に対して:
+  1. 各カメラの内部パラメータを推定
+  2. 参照カメラからの外部パラメータ（R, T）を推定
 
 手順:
-    1. generate_calib_sheet.py で calib_sheet.png を生成
-    2. A4で100%印刷、硬い板に貼って平面を保つ
-    3. 両カメラに全マーカーが写るよう置く
-    4. このスクリプトを起動し、シートを様々な角度・位置で見せて SPACE を押す
-    5. 5枚以上集めたら c でキャリブレーション実行
+  1. generate_calib_sheet.py で calib_sheet.png を生成、A4 で 100% 印刷
+  2. 硬い板に貼って平面を保つ
+  3. このスクリプトを起動、シートを各カメラに見せながら動かす
+  4. 全カメラが一斉に検出したら自動キャプチャ
+  5. 10〜15 ペア集まったら c でキャリブ実行
 
 使い方:
-    .venv/bin/python calibrate_auto.py
-
-操作:
-    SPACE : 両カメラで4マーカー全検出ができていたらペアを取得
-    c     : 収集したペアでキャリブレーション実行
-    d     : 最後に追加したペアを削除
-    q     : 終了
-
-推奨:
-    - 10〜15枚のペアで十分な精度
-    - シートの角度・位置・距離を変えながら取得
-    - 極端な斜めより、少しずつ変える方が精度が安定
+  .venv/bin/python calibrate_auto.py            # 撮影→キャリブ
+  .venv/bin/python calibrate_auto.py --recompute  # 保存済み生データから再計算
 """
 
 import cv2
@@ -32,57 +26,43 @@ import time
 import argparse
 
 sys.path.insert(0, os.path.dirname(__file__))
-from demo_realtime import CameraThread, CAM_PC, CAM_PHONE
+from camera_config import load_config, get_reference, CameraThread, CameraSpec
 
 
 META_PATH      = "calib_sheet_meta.json"
-OUTPUT_PATH    = "calibration/stereo_calib.json"
-RAW_DATA_PATH  = "calibration/raw_captures.npz"   # 生データ（再計算用）
+OUTPUT_PATH    = "calibration/cameras_calib.json"
+LEGACY_PATH    = "calibration/stereo_calib.json"   # 旧形式との互換用
+RAW_DATA_PATH  = "calibration/raw_captures.npz"
 MIN_PAIRS      = 5
 RECOMMEND      = 10
 
 
-# ---------- ArUco検出 ----------
+# ============================================================
+# ArUco 検出
+# ============================================================
 
 def setup_detector(meta: dict):
-    """メタから検出器を構築。"""
     dict_name = meta["aruco_dict"]
     aruco_dict = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, dict_name))
     params = cv2.aruco.DetectorParameters()
     params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
-    detector = cv2.aruco.ArucoDetector(aruco_dict, params)
-    return detector
+    return cv2.aruco.ArucoDetector(aruco_dict, params)
 
 
 def detect_markers(frame: np.ndarray, detector) -> dict:
-    """
-    フレームからArUcoを検出する。
-
-    Returns:
-        {marker_id: corners_np(4, 2)}  全マーカーが検出されなくても見つかった分だけ返す
-    """
+    """frame から全ArUcoを検出。{id: (4, 2) corners}"""
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     corners, ids, _ = detector.detectMarkers(gray)
-    result = {}
     if ids is None:
-        return result
-    for i, mid in enumerate(ids.flatten()):
-        # corners[i]: shape (1, 4, 2), 時計回り（左上→右上→右下→左下）
-        result[int(mid)] = corners[i].reshape(4, 2).astype(np.float64)
-    return result
+        return {}
+    return {
+        int(mid): corners[i].reshape(4, 2).astype(np.float64)
+        for i, mid in enumerate(ids.flatten())
+    }
 
 
-def extract_correspondences(
-    markers: dict,
-    markers_3d: dict,
-) -> tuple[np.ndarray, np.ndarray]:
-    """
-    検出マーカーと既知3D座標から対応点ペアを作る。
-
-    Returns:
-        img_pts_2d: (N, 2)
-        obj_pts_3d: (N, 3)
-    """
+def extract_correspondences(markers: dict, markers_3d: dict):
+    """検出結果と既知3D座標からペアを作る。"""
     img_pts, obj_pts = [], []
     for mid, corners_2d in markers.items():
         if str(mid) not in markers_3d:
@@ -94,356 +74,408 @@ def extract_correspondences(
     return np.array(img_pts, dtype=np.float32), np.array(obj_pts, dtype=np.float32)
 
 
-# ---------- キャリブレーション ----------
+# ============================================================
+# キャリブレーション計算
+# ============================================================
 
 def _init_intrinsic_matrix(img_size: tuple) -> np.ndarray:
-    """画像サイズから妥当な初期内部パラメータ行列を作る。
-    典型的なカメラで焦点距離は画像幅とほぼ同程度。"""
+    """画像サイズから初期内部パラメータ行列を作る。"""
     w, h = img_size
-    return np.array([
-        [w, 0, w / 2],
-        [0, w, h / 2],
-        [0, 0, 1.0],
-    ], dtype=np.float64)
+    return np.array([[w, 0, w/2], [0, w, h/2], [0, 0, 1.0]], dtype=np.float64)
 
 
-def run_calibration(obj_pts, img_pts1, img_pts2, img_size1, img_size2):
-    """個別キャリブ→ステレオキャリブ。"""
-    print(f"\nキャリブレーション実行中... ({len(obj_pts)}ペア)")
-    print(f"  カメラ1画像サイズ: {img_size1}")
-    print(f"  カメラ2画像サイズ: {img_size2}")
-
-    # 初期値ガイド + 制約強化（平面ターゲット+少数キャプチャでの発散を防ぐ）
+def calibrate_intrinsics(obj_pts, img_pts, img_size):
+    """単一カメラの内部パラメータを推定。"""
     flags = (cv2.CALIB_USE_INTRINSIC_GUESS |
-             cv2.CALIB_FIX_PRINCIPAL_POINT |   # 主点を画像中心に固定（広角補正済みカメラなら妥当）
+             cv2.CALIB_FIX_PRINCIPAL_POINT |   # 主点は画像中心に固定（広角補正済みカメラで妥当）
              cv2.CALIB_FIX_ASPECT_RATIO |      # fx = fy
              cv2.CALIB_ZERO_TANGENT_DIST |
              cv2.CALIB_FIX_K2 |
              cv2.CALIB_FIX_K3)
-
-    K1_init = _init_intrinsic_matrix(img_size1)
-    K2_init = _init_intrinsic_matrix(img_size2)
-
-    rms1, K1, d1, _, _ = cv2.calibrateCamera(
-        obj_pts, img_pts1, img_size1, K1_init, None, flags=flags
+    K_init = _init_intrinsic_matrix(img_size)
+    rms, K, dist, _, _ = cv2.calibrateCamera(
+        obj_pts, img_pts, img_size, K_init, None, flags=flags
     )
-    rms2, K2, d2, _, _ = cv2.calibrateCamera(
-        obj_pts, img_pts2, img_size2, K2_init, None, flags=flags
-    )
-    print(f"  個別RMS  Cam1={rms1:.3f}px  Cam2={rms2:.3f}px")
-    print(f"  Cam1 焦点 fx={K1[0,0]:.0f} fy={K1[1,1]:.0f}  中心 cx={K1[0,2]:.0f} cy={K1[1,2]:.0f}")
-    print(f"  Cam2 焦点 fx={K2[0,0]:.0f} fy={K2[1,1]:.0f}  中心 cx={K2[0,2]:.0f} cy={K2[1,2]:.0f}")
+    return rms, K, dist
 
-    # ステレオキャリブレーションは imageSize を使わないが、API上必須
+
+def calibrate_stereo(obj_pts, img_pts_a, img_pts_b, K_a, d_a, K_b, d_b, img_size_a):
+    """2カメラ間の外部パラメータ（R, T）を推定。"""
     rms, _, _, _, _, R, T, E, F = cv2.stereoCalibrate(
-        obj_pts, img_pts1, img_pts2,
-        K1, d1, K2, d2,
-        img_size1,
+        obj_pts, img_pts_a, img_pts_b,
+        K_a, d_a, K_b, d_b,
+        img_size_a,
         flags=cv2.CALIB_FIX_INTRINSIC,
     )
-    print(f"  ステレオRMS = {rms:.3f}px")
-
-    return {
-        "K1": K1.tolist(),
-        "K2": K2.tolist(),
-        "dist1": d1.tolist(),
-        "dist2": d2.tolist(),
-        "R": R.tolist(),
-        "T": T.tolist(),
-        "image_size":  img_size1,    # 旧API互換
-        "image_size1": img_size1,
-        "image_size2": img_size2,
-        "n_images": len(obj_pts),
-        "rms_error": round(rms, 4),
-        "rms_cam1":  round(rms1, 4),
-        "rms_cam2":  round(rms2, 4),
-        "method": "aruco_sheet",
-    }
+    return rms, R, T
 
 
-# ---------- 生データの保存・読み込み ----------
+# ============================================================
+# 生データ保存/読み込み
+# ============================================================
 
-def save_raw_captures(obj_pts_all, img_pts1_all, img_pts2_all,
-                       img_size1, img_size2, path: str = RAW_DATA_PATH):
-    """キャプチャの生データを npz に保存する（再計算用）。"""
+def save_raw_captures(captures: dict, roles: list[str],
+                       img_sizes: dict, obj_pts_all: list, path: str = RAW_DATA_PATH):
+    """
+    captures: {role: [img_pts_array, ...]}  各キャプチャでのカメラ別2D点
+    obj_pts_all: [obj_pts, ...]             共通の3D点（各キャプチャ）
+    """
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    np.savez(
-        path,
-        obj_pts=np.array([p.reshape(-1, 3) for p in obj_pts_all], dtype=object),
-        img_pts1=np.array([p.reshape(-1, 2) for p in img_pts1_all], dtype=object),
-        img_pts2=np.array([p.reshape(-1, 2) for p in img_pts2_all], dtype=object),
-        img_size1=np.array(img_size1),
-        img_size2=np.array(img_size2),
-    )
+    save_dict = {
+        "roles": np.array(roles),
+        "obj_pts": np.array([p.reshape(-1, 3) for p in obj_pts_all], dtype=object),
+    }
+    for role in roles:
+        save_dict[f"img_pts_{role}"] = np.array(
+            [p.reshape(-1, 2) for p in captures[role]], dtype=object
+        )
+        save_dict[f"size_{role}"] = np.array(img_sizes[role])
+    np.savez(path, **save_dict)
 
 
 def load_raw_captures(path: str = RAW_DATA_PATH):
-    """保存された生データを読み込む。"""
     data = np.load(path, allow_pickle=True)
-    obj_pts_all  = [np.asarray(p, dtype=np.float32).reshape(-1, 1, 3)
-                    for p in data["obj_pts"]]
-    img_pts1_all = [np.asarray(p, dtype=np.float32).reshape(-1, 1, 2)
-                    for p in data["img_pts1"]]
-    img_pts2_all = [np.asarray(p, dtype=np.float32).reshape(-1, 1, 2)
-                    for p in data["img_pts2"]]
-    img_size1 = tuple(int(x) for x in data["img_size1"])
-    img_size2 = tuple(int(x) for x in data["img_size2"])
-    return obj_pts_all, img_pts1_all, img_pts2_all, img_size1, img_size2
+    roles = [str(r) for r in data["roles"]]
+    obj_pts_all = [np.asarray(p, dtype=np.float32).reshape(-1, 1, 3) for p in data["obj_pts"]]
+    captures = {}
+    img_sizes = {}
+    for role in roles:
+        captures[role] = [
+            np.asarray(p, dtype=np.float32).reshape(-1, 1, 2)
+            for p in data[f"img_pts_{role}"]
+        ]
+        img_sizes[role] = tuple(int(x) for x in data[f"size_{role}"])
+    return roles, obj_pts_all, captures, img_sizes
 
 
-# ---------- メイン ----------
+# ============================================================
+# 全処理
+# ============================================================
+
+def compute_all(roles: list[str], obj_pts_all: list,
+                 captures: dict, img_sizes: dict,
+                 reference_role: str) -> dict:
+    """
+    各カメラの内部パラメータ + 参照カメラからの外部パラメータを計算。
+    """
+    print(f"\n=== キャリブレーション計算 ({len(obj_pts_all)}ペア) ===\n")
+
+    intrinsics = {}
+    for role in roles:
+        img_pts = captures[role]
+        size = img_sizes[role]
+        rms, K, dist = calibrate_intrinsics(obj_pts_all, img_pts, size)
+        intrinsics[role] = {
+            "K":          K.tolist(),
+            "dist":       dist.tolist(),
+            "image_size": list(size),
+            "rms":        round(float(rms), 4),
+        }
+        print(f"[{role}] {size}  RMS={rms:.3f}px  "
+              f"fx={K[0,0]:.0f} fy={K[1,1]:.0f} cx={K[0,2]:.0f} cy={K[1,2]:.0f}")
+
+    print()
+
+    # 外部パラメータ: 参照カメラを原点（R=I, T=0）、他は参照からの相対
+    extrinsics = {reference_role: {"R": np.eye(3).tolist(), "T": [0, 0, 0], "rms": 0.0}}
+    for role in roles:
+        if role == reference_role:
+            continue
+        K_ref  = np.array(intrinsics[reference_role]["K"])
+        d_ref  = np.array(intrinsics[reference_role]["dist"])
+        K_this = np.array(intrinsics[role]["K"])
+        d_this = np.array(intrinsics[role]["dist"])
+        rms, R, T = calibrate_stereo(
+            obj_pts_all,
+            captures[reference_role], captures[role],
+            K_ref, d_ref, K_this, d_this,
+            img_sizes[reference_role],
+        )
+        extrinsics[role] = {
+            "R":   R.tolist(),
+            "T":   T.tolist(),
+            "rms": round(float(rms), 4),
+        }
+        print(f"[{reference_role} -> {role}] ステレオRMS={rms:.3f}px")
+
+    return {
+        "version":         2,
+        "reference":       reference_role,
+        "camera_roles":    roles,
+        "intrinsics":      intrinsics,
+        "extrinsics":      extrinsics,
+    }
+
+
+def save_result(result: dict):
+    """新形式（cameras_calib.json）と旧形式（stereo_calib.json）の両方を出力。"""
+    os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
+    with open(OUTPUT_PATH, "w") as f:
+        json.dump(result, f, indent=2)
+    print(f"\n保存: {OUTPUT_PATH}")
+
+    # 旧形式互換（2カメラの場合のみ）
+    roles = result["camera_roles"]
+    if len(roles) == 2:
+        ref = result["reference"]
+        other = [r for r in roles if r != ref][0]
+        legacy = {
+            "K1":          result["intrinsics"][ref]["K"],
+            "K2":          result["intrinsics"][other]["K"],
+            "dist1":       result["intrinsics"][ref]["dist"],
+            "dist2":       result["intrinsics"][other]["dist"],
+            "R":           result["extrinsics"][other]["R"],
+            "T":           result["extrinsics"][other]["T"],
+            "image_size":  result["intrinsics"][ref]["image_size"],
+            "image_size1": result["intrinsics"][ref]["image_size"],
+            "image_size2": result["intrinsics"][other]["image_size"],
+            "n_images":    0,   # 新形式に記録
+            "rms_error":   result["extrinsics"][other]["rms"],
+            "rms_cam1":    result["intrinsics"][ref]["rms"],
+            "rms_cam2":    result["intrinsics"][other]["rms"],
+            "method":      "aruco_sheet_v2",
+        }
+        with open(LEGACY_PATH, "w") as f:
+            json.dump(legacy, f, indent=2)
+        print(f"保存（互換）: {LEGACY_PATH}")
+
+
+def save_sheet_positions(meta: dict):
+    """シート位置を card_positions.json として保存（3Dビュー用）。"""
+    sheet_corners = []
+    for mid, corners_3d in sorted(meta["markers_3d"].items(), key=lambda x: int(x[0])):
+        sheet_corners.append({"id": int(mid), "corners": corners_3d})
+    with open("calibration/card_positions.json", "w") as f:
+        json.dump({"cards": sheet_corners,
+                   "note": "ArUco markers from calib sheet"}, f, indent=2)
+
+
+# ============================================================
+# メイン
+# ============================================================
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="N カメラ自動ステレオキャリブレーション（ArUcoシート使用）"
+    )
     parser.add_argument("--recompute", action="store_true",
-                        help="前回保存した生データから再計算（撮影しない）")
+                        help="保存済み生データから再計算（撮影しない）")
+    parser.add_argument("--config",    default="cameras_config.json",
+                        help="カメラ設定ファイルパス")
     args = parser.parse_args()
 
-    # 再計算モード
+    # === 再計算モード ===
     if args.recompute:
         if not os.path.exists(RAW_DATA_PATH):
-            print(f"{RAW_DATA_PATH} がありません。一度通常モードで取得してください。")
+            print(f"{RAW_DATA_PATH} がありません。先に撮影してください。")
             sys.exit(1)
-        print(f"=== 再計算モード ===")
-        print(f"生データ読み込み: {RAW_DATA_PATH}")
-        obj_pts_all, img_pts1_all, img_pts2_all, img_size1, img_size2 = load_raw_captures()
-        print(f"  {len(obj_pts_all)} ペア")
+        print(f"=== 再計算モード ===  {RAW_DATA_PATH}")
+        roles, obj_pts_all, captures, img_sizes = load_raw_captures()
 
-        result = run_calibration(obj_pts_all, img_pts1_all, img_pts2_all,
-                                  img_size1, img_size2)
-        os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
-        with open(OUTPUT_PATH, "w") as f:
-            json.dump(result, f, indent=2)
+        # 参照カメラ: config から決定（無ければ最初）
+        specs = load_config(args.config)
+        ref_spec = get_reference(specs) if specs else None
+        reference_role = ref_spec.role if ref_spec and ref_spec.role in roles else roles[0]
 
-        # シート位置も保存
+        print(f"  ペア数: {len(obj_pts_all)}")
+        print(f"  カメラ: {roles}")
+        print(f"  参照  : {reference_role}")
+
+        result = compute_all(roles, obj_pts_all, captures, img_sizes, reference_role)
+        save_result(result)
         with open(META_PATH) as f:
             meta = json.load(f)
-        sheet_corners = []
-        for mid, corners_3d in sorted(meta["markers_3d"].items(), key=lambda x: int(x[0])):
-            sheet_corners.append({"id": int(mid), "corners": corners_3d})
-        with open("calibration/card_positions.json", "w") as f:
-            json.dump({"cards": sheet_corners,
-                        "note": "ArUco markers from calib sheet"}, f, indent=2)
-
-        print(f"\n保存: {OUTPUT_PATH}")
-        print(f"ステレオRMS: {result['rms_error']:.4f} px")
+        save_sheet_positions(meta)
         return
 
+    # === 撮影 → キャリブ モード ===
     if not os.path.exists(META_PATH):
         print(f"{META_PATH} がありません。先に generate_calib_sheet.py を実行してください。")
         sys.exit(1)
 
     with open(META_PATH) as f:
         meta = json.load(f)
-
     detector = setup_detector(meta)
     markers_3d = meta["markers_3d"]
     n_required = len(markers_3d)
 
-    # 両カメラを同じ解像度に揃える（キャリブの安定性のため）
-    CALIB_W, CALIB_H = 1280, 720
-    cam_pc    = CameraThread(CAM_PC,    "Mac",   width=CALIB_W, height=CALIB_H)
-    cam_phone = CameraThread(CAM_PHONE, "Phone", width=CALIB_W, height=CALIB_H)
-    cam_pc.start(); cam_phone.start()
-    time.sleep(1.0)
+    # カメラ読み込み
+    specs = load_config(args.config)
+    print(f"=== ArUco 自動キャリブレーション ===")
+    print(f"カメラ数: {len(specs)}")
+    for s in specs:
+        ref = " [REF]" if s.is_reference else ""
+        print(f"  {s.role}: id={s.id} {s.name}{ref}")
 
-    print(f"=== ArUcoシート自動キャリブレーション ===")
-    print(f"必要マーカー: {n_required}個（全部見えた時だけペアを取れます）")
-    print(f"モード: AUTO（停止→自動取得）  a=手動/自動切替  c=キャリブ実行  d=削除  q=終了")
-    print(f"目標: {RECOMMEND}ペア\n")
+    threads = {s.role: CameraThread(s) for s in specs}
+    for t in threads.values():
+        t.start()
+    time.sleep(1.5)
+    roles = [s.role for s in specs]
+    reference_role = get_reference(specs).role
 
-    obj_pts_all, img_pts1_all, img_pts2_all = [], [], []
-    img_size1 = None
-    img_size2 = None
+    # 取得状態
+    obj_pts_all = []
+    captures = {role: [] for role in roles}
+    img_sizes = {role: None for role in roles}
 
-    # 自動取得モード（デフォルトON）
     auto_mode = True
-    # 安定判定: 全マーカーが検出できて、平均位置が前回取得時から十分動いた状態で
-    # STABLE_FRAMES フレーム連続静止したら取得
-    STABLE_FRAMES      = 12    # 約0.4秒（30fps想定）
-    STILL_THRESHOLD_PX = 3.0   # このピクセル以下の動きを「静止」とみなす
-    DIFF_THRESHOLD_PX  = 30.0  # 前回取得との最小変化量
-
+    STABLE_FRAMES = 12
+    STILL_THRESHOLD_PX = 3.0
+    DIFF_THRESHOLD_PX = 30.0
     stable_count = 0
-    last_m1_center = None
-    last_captured_m1_center = None
+    last_center = None
+    last_captured_center = None
+
+    print(f"\n必要マーカー: {n_required}個 × 全 {len(roles)} カメラで検出")
+    print(f"AUTO=静止で自動取得  a=手動/自動切替  c=キャリブ実行  d=削除  q/ESC=終了")
+    print(f"目標: {RECOMMEND} ペア\n")
+
+    win = "N-Camera Calibration"
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
 
     try:
         while True:
-            f1 = cam_pc.get_frame()
-            f2 = cam_phone.get_frame()
-            if f1 is None or f2 is None:
+            frames = {role: threads[role].get_frame() for role in roles}
+            if any(f is None for f in frames.values()):
                 time.sleep(0.01); continue
 
-            if img_size1 is None:
-                img_size1 = (f1.shape[1], f1.shape[0])
-                img_size2 = (f2.shape[1], f2.shape[0])
-                if img_size1 != img_size2:
-                    print(f"  注意: 解像度が異なります Cam1={img_size1} Cam2={img_size2}")
+            # 解像度を記録
+            for role in roles:
+                if img_sizes[role] is None:
+                    img_sizes[role] = (frames[role].shape[1], frames[role].shape[0])
 
-            m1 = detect_markers(f1, detector)
-            m2 = detect_markers(f2, detector)
+            # 各カメラでArUco検出
+            detected = {role: detect_markers(frames[role], detector) for role in roles}
 
-            # 両カメラで検出された共通のマーカーID
-            common_ids = set(m1.keys()) & set(m2.keys()) & set(int(k) for k in markers_3d.keys())
-            all_detected = len(common_ids) == n_required
+            # 全カメラで検出された共通ID
+            common = set(detected[roles[0]].keys())
+            for role in roles[1:]:
+                common &= set(detected[role].keys())
+            common &= set(int(k) for k in markers_3d.keys())
+            all_detected = len(common) == n_required
 
-            # 自動取得判定: 全マーカー検出 + 静止 + 前回から動いた
+            # 自動取得判定（参照カメラの中心を基準）
             auto_capture_now = False
             if all_detected:
-                # 現在のマーカー中心（全マーカー平均）
-                cur_center = np.mean([m1[i].mean(axis=0) for i in common_ids], axis=0)
-
-                if last_m1_center is not None:
-                    movement = float(np.linalg.norm(cur_center - last_m1_center))
-                else:
-                    movement = 999.0
-
-                # 前回取得からの変化量
-                if last_captured_m1_center is not None:
-                    diff_from_last = float(np.linalg.norm(cur_center - last_captured_m1_center))
-                else:
-                    diff_from_last = 999.0
-
-                last_m1_center = cur_center
-
-                # 静止 + 十分変化 → カウントアップ
+                ref_marker_centers = np.array([detected[reference_role][i].mean(axis=0)
+                                                for i in common])
+                cur_center = ref_marker_centers.mean(axis=0)
+                movement = float(np.linalg.norm(cur_center - last_center)) if last_center is not None else 999.0
+                diff_from_last = float(np.linalg.norm(cur_center - last_captured_center)) if last_captured_center is not None else 999.0
+                last_center = cur_center
                 if movement < STILL_THRESHOLD_PX and diff_from_last > DIFF_THRESHOLD_PX:
                     stable_count += 1
                 else:
                     stable_count = 0
-
                 if auto_mode and stable_count >= STABLE_FRAMES:
                     auto_capture_now = True
                     stable_count = 0
             else:
                 stable_count = 0
-                last_m1_center = None
+                last_center = None
 
             # 表示
-            d1 = f1.copy()
-            d2 = f2.copy()
-            for mid, corners in m1.items():
-                color = (0, 255, 0) if mid in common_ids else (0, 200, 255)
-                cv2.polylines(d1, [corners.astype(np.int32)], True, color, 2)
-                c = corners.mean(axis=0).astype(int)
-                cv2.putText(d1, f"#{mid}", tuple(c), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-            for mid, corners in m2.items():
-                color = (0, 255, 0) if mid in common_ids else (0, 200, 255)
-                cv2.polylines(d2, [corners.astype(np.int32)], True, color, 2)
-                c = corners.mean(axis=0).astype(int)
-                cv2.putText(d2, f"#{mid}", tuple(c), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+            tiles = []
+            for role in roles:
+                f = frames[role].copy()
+                for mid, corners in detected[role].items():
+                    color = (0, 255, 0) if mid in common else (0, 160, 255)
+                    cv2.polylines(f, [corners.astype(np.int32)], True, color, 3)
+                    c = corners.mean(axis=0).astype(int)
+                    cv2.putText(f, f"#{mid}", tuple(c),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+                f_small = cv2.resize(f, (480, 270))
+                ref_str = " [REF]" if role == reference_role else ""
+                cv2.putText(f_small, f"{role}{ref_str}  det={len(detected[role])}",
+                            (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
+                if auto_mode and all_detected:
+                    bar_w = int(480 * stable_count / STABLE_FRAMES)
+                    cv2.rectangle(f_small, (0, 265), (bar_w, 270), (0, 255, 0), -1)
+                tiles.append(f_small)
 
-            d1 = cv2.resize(d1, (640, 360))
-            d2 = cv2.resize(d2, (640, 360))
+            # グリッド配置
+            cols = min(3, len(tiles))
+            rows = (len(tiles) + cols - 1) // cols
+            while len(tiles) < rows * cols:
+                tiles.append(np.zeros_like(tiles[0]))
+            grid_rows = []
+            for r in range(rows):
+                grid_rows.append(np.hstack(tiles[r * cols:(r + 1) * cols]))
+            canvas = np.vstack(grid_rows)
 
-            status_color = (0, 255, 0) if all_detected else (0, 140, 255)
-            status = f"{len(common_ids)}/{n_required} common markers"
-            if all_detected and auto_mode:
-                progress = stable_count / STABLE_FRAMES
-                status += f"  -> 静止中 [{int(progress*100)}%]"
-            elif all_detected:
-                status += "  -> SPACE で取得"
-            cv2.putText(d1, f"Mac    {len(m1)} detected",
-                        (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
-            cv2.putText(d2, f"iPhone {len(m2)} detected",
-                        (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
-            # 自動取得ゲージ
-            if all_detected and auto_mode:
-                bar_w = int(640 * stable_count / STABLE_FRAMES)
-                cv2.rectangle(d1, (0, 352), (bar_w, 360), (0, 255, 0), -1)
-
-            canvas = np.hstack([d1, d2])
-            bar = np.zeros((44, canvas.shape[1], 3), dtype=np.uint8)
-            mode_label = "AUTO" if auto_mode else "MANUAL"
+            bar = np.zeros((40, canvas.shape[1], 3), dtype=np.uint8)
+            mode = "AUTO" if auto_mode else "MANUAL"
+            stat_c = (0, 255, 0) if all_detected else (0, 140, 255)
             cv2.putText(bar,
-                        f"Pairs: {len(obj_pts_all)}/{RECOMMEND}  [{mode_label}]  {status}",
-                        (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, status_color, 2)
+                        f"Pairs: {len(obj_pts_all)}/{RECOMMEND}  [{mode}]  "
+                        f"common={len(common)}/{n_required}",
+                        (10, 27), cv2.FONT_HERSHEY_SIMPLEX, 0.6, stat_c, 2)
             canvas = np.vstack([canvas, bar])
-            cv2.imshow("ArUco Calibration", canvas)
+            cv2.imshow(win, canvas)
 
-            def capture_pair():
-                nonlocal last_captured_m1_center
-                m1_common = {k: m1[k] for k in common_ids}
-                m2_common = {k: m2[k] for k in common_ids}
-                img_pts1, obj_pts = extract_correspondences(m1_common, markers_3d)
-                img_pts2, _       = extract_correspondences(m2_common, markers_3d)
+            def do_capture():
+                nonlocal last_captured_center
+                # 最初のキャプチャで3D点が確定する
+                any_role = next(iter(common))
+                # obj_pts は全カメラ共通。ここでは参照カメラの検出から抽出
+                img_pts_ref, obj_pts = extract_correspondences(
+                    {k: detected[reference_role][k] for k in common},
+                    markers_3d
+                )
                 obj_pts_all.append(obj_pts.reshape(-1, 1, 3))
-                img_pts1_all.append(img_pts1.reshape(-1, 1, 2))
-                img_pts2_all.append(img_pts2.reshape(-1, 1, 2))
-                last_captured_m1_center = np.mean([m1[i].mean(axis=0) for i in common_ids], axis=0)
-                # 生データを毎回保存（落ちても大丈夫なように）
-                save_raw_captures(obj_pts_all, img_pts1_all, img_pts2_all,
-                                   img_size1, img_size2)
-                print(f"  ペア {len(obj_pts_all)} 取得 ({len(obj_pts)}点)")
-                # 取得フラッシュ
+
+                for role in roles:
+                    img_pts, _ = extract_correspondences(
+                        {k: detected[role][k] for k in common},
+                        markers_3d
+                    )
+                    captures[role].append(img_pts.reshape(-1, 1, 2))
+
+                # 生データ保存
+                save_raw_captures(captures, roles, img_sizes, obj_pts_all)
+
+                last_captured_center = cur_center
+                print(f"  ペア {len(obj_pts_all)} 取得 ({len(obj_pts)}点 × {len(roles)}カメラ)")
                 flash = canvas.copy()
-                cv2.rectangle(flash, (0, 0), (canvas.shape[1], canvas.shape[0]),
+                cv2.rectangle(flash, (0, 0), (flash.shape[1], flash.shape[0]),
                               (0, 255, 0), 10)
                 cv2.putText(flash, f"CAPTURED {len(obj_pts_all)}",
-                            (flash.shape[1]//2 - 120, flash.shape[0]//2),
+                            (flash.shape[1]//2 - 130, flash.shape[0]//2),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 4)
-                cv2.imshow("ArUco Calibration", flash)
+                cv2.imshow(win, flash)
                 cv2.waitKey(300)
 
             if auto_capture_now:
-                capture_pair()
+                do_capture()
 
             key = cv2.waitKey(1) & 0xFF
-            if key == ord("q") or key == 27:   # q or ESC
+            if key == ord("q") or key == 27:
                 break
             elif key == ord("a"):
                 auto_mode = not auto_mode
                 stable_count = 0
-                print(f"  モード切替: {'AUTO' if auto_mode else 'MANUAL'}")
+                print(f"  モード: {'AUTO' if auto_mode else 'MANUAL'}")
             elif key == ord(" ") and all_detected:
-                capture_pair()
-
+                do_capture()
             elif key == ord("d") and obj_pts_all:
-                obj_pts_all.pop(); img_pts1_all.pop(); img_pts2_all.pop()
+                obj_pts_all.pop()
+                for role in roles:
+                    captures[role].pop()
                 print(f"  最後のペアを削除 (残り {len(obj_pts_all)})")
-
             elif key == ord("c"):
                 if len(obj_pts_all) < MIN_PAIRS:
                     print(f"  ペア不足: {len(obj_pts_all)}/{MIN_PAIRS}")
                     continue
                 cv2.destroyAllWindows()
-
-                result = run_calibration(
-                    obj_pts_all, img_pts1_all, img_pts2_all,
-                    img_size1, img_size2
-                )
-
-                os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
-                with open(OUTPUT_PATH, "w") as f:
-                    json.dump(result, f, indent=2)
-
-                # シート位置を card_positions.json 相当として保存（3Dビューで見られる）
-                sheet_corners = []
-                for mid, corners_3d in sorted(markers_3d.items(), key=lambda x: int(x[0])):
-                    sheet_corners.append({
-                        "id": int(mid),
-                        "corners": corners_3d,
-                    })
-                with open("calibration/card_positions.json", "w") as f:
-                    json.dump({
-                        "cards": sheet_corners,
-                        "note": "ArUco markers from calib sheet (not actual karuta cards)"
-                    }, f, indent=2)
-
-                print(f"\n保存: {OUTPUT_PATH}")
-                print(f"RMS再投影誤差: {result['rms_error']:.4f} px")
-                if result["rms_error"] < 1.0:
-                    print("  ✓ 非常に良好")
-                elif result["rms_error"] < 3.0:
-                    print("  ✓ 良好")
-                else:
-                    print("  ⚠ やや大きい。シートを平らに保つ・枚数を増やすと改善")
-                print("\ndemo_realtime/demo_live 再起動で自動適用されます。")
+                result = compute_all(roles, obj_pts_all, captures, img_sizes, reference_role)
+                save_result(result)
+                save_sheet_positions(meta)
                 break
 
     finally:
-        cam_pc.stop(); cam_phone.stop()
+        for t in threads.values():
+            t.stop()
         cv2.destroyAllWindows()
 
 
