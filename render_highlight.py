@@ -148,6 +148,77 @@ def detect_take_moments(frames: list[dict],
     return takes
 
 
+# ---------- 札平面に座標系を合わせる ----------
+
+def align_to_card_plane(frames: list[dict], cards: list) -> tuple[list[dict], list]:
+    """
+    札が置かれている平面を Y=0（地面）にして、平面の法線を Y+（上）にする。
+    Three.js は Y-up なので、これで「札が地面、手が上から」という自然な向きになる。
+    """
+    if not cards:
+        print("  札がないので座標変換はスキップ")
+        return frames, cards
+
+    # 札の全コーナーから平面を推定
+    all_corners = []
+    for card in cards:
+        for c in card["corners"]:
+            all_corners.append(c)
+    pts = np.array(all_corners, dtype=np.float64)
+
+    # 重心
+    centroid = pts.mean(axis=0)
+    centered = pts - centroid
+
+    # SVDで平面の法線を求める
+    _, _, Vt = np.linalg.svd(centered)
+    normal = Vt[-1]   # 最小特異値に対応
+    # 上向きに向ける（zが正の方向）
+    if normal[2] < 0:
+        normal = -normal
+
+    # 法線を Y+ に揃える回転を作る
+    up_axis = np.array([0, 1, 0], dtype=np.float64)
+    # normal と up_axis の外積から回転軸、内積から角度
+    v = np.cross(normal, up_axis)
+    s = np.linalg.norm(v)
+    c = np.dot(normal, up_axis)
+
+    if s < 1e-8:
+        # すでに平行
+        R = np.eye(3) if c > 0 else -np.eye(3)
+    else:
+        vx = np.array([
+            [    0, -v[2],  v[1]],
+            [ v[2],     0, -v[0]],
+            [-v[1],  v[0],     0],
+        ])
+        R = np.eye(3) + vx + vx @ vx * ((1 - c) / (s * s))
+
+    def transform(p):
+        p_arr = np.asarray(p, dtype=np.float64)
+        return (R @ (p_arr - centroid)).tolist()
+
+    # フレームを変換
+    new_frames = []
+    for f in frames:
+        nf = {"t": f["t"], "landmarks": {}}
+        for lm in LANDMARKS:
+            nf["landmarks"][lm] = transform(f["landmarks"][lm])
+        new_frames.append(nf)
+
+    # 札を変換
+    new_cards = []
+    for card in cards:
+        new_cards.append({
+            **card,
+            "corners": [transform(c) for c in card["corners"]],
+        })
+
+    print(f"  平面合わせ: 法線 {normal.round(3)} -> Y+ に回転")
+    return new_frames, new_cards
+
+
 # ---------- 出力 ----------
 
 def build_output(frames: list[dict], cards: list, takes: list,
@@ -224,6 +295,9 @@ def main():
 
     cards = load_cards()
     print(f"札: {len(cards)} 個")
+
+    # 札を地面として座標系を揃える
+    frames, cards = align_to_card_plane(frames, cards)
 
     takes = detect_take_moments(frames)
     print(f"Take検出: {len(takes)} 件 at {takes}")
