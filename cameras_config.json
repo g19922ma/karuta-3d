@@ -5,24 +5,24 @@
       "id": 0,
       "role": "main_canon",
       "name": "Canon R50",
-      "resolution": null,
-      "fps": null,
+      "resolution": [1920, 1080],
+      "fps": 30,
       "is_reference": true
     },
     {
       "id": 1,
       "role": "iphone",
       "name": "iPhone",
-      "resolution": null,
-      "fps": null,
+      "resolution": [1920, 1080],
+      "fps": 30,
       "is_reference": false
     },
     {
       "id": 2,
       "role": "macbook",
       "name": "MacBook内蔵",
-      "resolution": null,
-      "fps": null,
+      "resolution": [1280, 720],
+      "fps": 30,
       "is_reference": false
     }
   ]
