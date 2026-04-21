@@ -250,15 +250,27 @@ def build_output(frames: list[dict], cards: list, takes: list,
 
 # ---------- ローカルサーバ起動（fetchがfile://だと動かないので） ----------
 
-def start_server(port: int = 8011, directory: str = None) -> socketserver.TCPServer:
-    """Three.js ビューア用の静的ファイルサーバを立てる。"""
+class _ReusableTCPServer(socketserver.TCPServer):
+    allow_reuse_address = True
+
+
+def start_server(port: int = 8011, directory: str = None) -> tuple[socketserver.TCPServer, int]:
+    """
+    Three.js ビューア用の静的ファイルサーバを立てる。
+    指定ポートが使用中なら +1 ずつずらして空きを探す。
+    """
     if directory:
         os.chdir(directory)
     handler = http.server.SimpleHTTPRequestHandler
-    httpd = socketserver.TCPServer(("127.0.0.1", port), handler)
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-    thread.start()
-    return httpd
+    for tried in range(20):
+        try:
+            httpd = _ReusableTCPServer(("127.0.0.1", port + tried), handler)
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            return httpd, port + tried
+        except OSError:
+            continue
+    raise RuntimeError("空きポートが見つかりません")
 
 
 # ---------- メイン ----------
@@ -313,8 +325,8 @@ def main():
 
     # ビューア起動
     if not args.no_open:
-        httpd = start_server(args.port)
-        url = f"http://127.0.0.1:{args.port}/highlight/"
+        httpd, used_port = start_server(args.port)
+        url = f"http://127.0.0.1:{used_port}/highlight/"
         print(f"ビューア起動: {url}")
         webbrowser.open(url)
         print("Ctrl+C で終了")
